@@ -1,5 +1,6 @@
 import argparse
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
@@ -7,7 +8,7 @@ import requests
 from . import google_auth
 from .drive import ApiError, Drive
 from .models import Settings, Story
-from .runner import Runner
+from .runner import Runner, poll_retry
 from .storage import Store, parse_json
 from .youtube import YouTube
 
@@ -85,31 +86,38 @@ def main():
             http, persist = google_auth.session(base)
             try:
                 youtube = YouTube(http)
-                youtube.verify_channel(settings.youtube_channel_id)
-                runner = Runner(settings, base, store, Drive(http), youtube)
+                runner = None
                 failures = 0
                 while True:
+                    pause = None
                     try:
+                        if runner is None:
+                            youtube.verify_channel(settings.youtube_channel_id)
+                            runner = Runner(settings, base, store, Drive(http), youtube)
                         runner.cycle()
                         failures = 0
                     except (ApiError, requests.RequestException) as error:
-                        failures += 1
-                        transient = isinstance(
-                            error, requests.RequestException
-                        ) or error.status in {429, 500, 502, 503, 504}
-                        if args.once or not transient or failures >= 10:
-                            raise
-                        print(
-                            "Discovery temporarily unavailable; retrying with saved history intact."
+                        action, failures, pause = poll_retry(
+                            error,
+                            failures,
+                            args.once,
+                            datetime.now(UTC),
+                            settings.poll_seconds,
                         )
+                        if action == "stop":
+                            raise
+                        if action == "quota":
+                            print(
+                                "API quota exhausted; waiting for the next reset. Saved history is intact."
+                            )
+                        else:
+                            print(
+                                "Discovery temporarily unavailable; retrying with saved history intact."
+                            )
                     persist()
                     if args.once:
                         break
-                    time.sleep(
-                        max(settings.poll_seconds, min(3600, 30 * 2**failures))
-                        if failures
-                        else settings.poll_seconds
-                    )
+                    time.sleep(settings.poll_seconds if pause is None else pause)
             finally:
                 persist()
                 http.close()
