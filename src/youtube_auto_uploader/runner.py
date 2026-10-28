@@ -80,6 +80,17 @@ class Runner:
                 self.report(
                     f"Story {sid}: waiting for valid config and two unique videos ({type(error).__name__})"
                 )
+            except ApiError as error:
+                self.report(f"Story {sid}: HTTP {error.status}: {error.reason}")
+            except requests.RequestException as error:
+                # Do not print the exception text; it may contain a request URL.
+                response = getattr(error, "response", None)
+                status = getattr(response, "status_code", None)
+                reason = getattr(response, "reason", None) or type(error).__name__
+                if status is None:
+                    self.report(f"Story {sid}: {reason}")
+                else:
+                    self.report(f"Story {sid}: HTTP {status}: {reason}")
 
     def step(self, sid, role, record):
         video = Story.model_validate(record["snapshot"]).videos[role]

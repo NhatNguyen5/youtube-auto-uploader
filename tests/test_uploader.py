@@ -9,7 +9,7 @@ import portalocker
 import pytest
 import requests
 
-from youtube_auto_uploader.drive import Drive
+from youtube_auto_uploader.drive import ApiError, Drive
 from youtube_auto_uploader.models import Settings, Story
 from youtube_auto_uploader.runner import Runner
 from youtube_auto_uploader.storage import Store, atomic_json, parse_json
@@ -355,9 +355,69 @@ def test_changed_source_stops_download(tmp_path):
     drive.http.get.assert_not_called()
 
 
-def test_incomplete_session_no_progress_does_not_loop(tmp_path):
-    from youtube_auto_uploader.drive import ApiError
+def _http_error(status, reason):
+    error = requests.HTTPError("secret URL must not be logged")
+    error.response = Mock(status_code=status, reason=reason)
+    return error
 
+
+@pytest.mark.parametrize(
+    ("failure", "reported"),
+    [
+        (ApiError(403, "fileNotDownloadable"), "HTTP 403: fileNotDownloadable"),
+        (requests.ConnectionError("secret URL must not be logged"), "ConnectionError"),
+        (_http_error(404, "notFound"), "HTTP 404: notFound"),
+    ],
+)
+def test_story_discovery_error_does_not_block_other_stories(setup, failure, reported):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    drive.children.return_value = [
+        {
+            "id": "folder-a",
+            "name": "Broken",
+            "mimeType": "application/vnd.google-apps.folder",
+        },
+        {
+            "id": "folder-b",
+            "name": "Ready",
+            "mimeType": "application/vnd.google-apps.folder",
+        },
+    ]
+
+    def story(folder_id):
+        if folder_id == "folder-a":
+            raise failure
+        return (
+            Story.model_validate(story_data()),
+            {role: source(role) for role in ("long", "short")},
+        )
+
+    drive.story.side_effect = story
+    runner.cycle()
+    assert set(runner.state["stories"]) == {"folder-b"}
+    assert set(runner.state["stories"]["folder-b"]["jobs"]) == {"long", "short"}
+    assert {call.args[1]["id"] for call in youtube.start.call_args_list} == {
+        "long",
+        "short",
+    }
+    text = "\n".join(reports)
+    assert f"Story folder-a: {reported}" in text
+    assert "secret URL" not in text
+
+
+def test_root_listing_api_error_still_stops_the_cycle(setup):
+    runner, store, drive, youtube = setup
+    drive.children.side_effect = ApiError(404, "notFound")
+    with pytest.raises(ApiError, match="404") as caught:
+        runner.cycle()
+    assert caught.value.reason == "notFound"
+    youtube.start.assert_not_called()
+    drive.story.assert_not_called()
+
+
+def test_incomplete_session_no_progress_does_not_loop(tmp_path):
     path = tmp_path / "video"
     path.write_bytes(b"abc")
     http = Mock()
