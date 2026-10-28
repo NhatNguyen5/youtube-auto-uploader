@@ -8,15 +8,34 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 from .storage import atomic_json
 
+# login requests every scope the commands need. drive.readonly reads the story
+# inbox and finds an existing stats file. drive.file creates and overwrites that
+# stats file only. youtube.force-ssl uploads and reads the channel.
+# yt-analytics.readonly covers YouTube Analytics reports.query.
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/youtube.force-ssl",
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
 ]
 
 
 def token_path(base):
     load_dotenv(base / ".env", override=False)
     return base / os.getenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
+
+
+def read_token(base):
+    path = token_path(base)
+    if not path.exists():
+        raise ValueError("OAuth token missing; run login first")
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def missing_scopes(base):
+    _, info = read_token(base)
+    granted = set(info.get("scopes") or [])
+    return [scope for scope in SCOPES if scope not in granted]
 
 
 def login(base):
@@ -44,10 +63,12 @@ def login(base):
 
 
 def session(base):
-    path = token_path(base)
-    if not path.exists():
-        raise ValueError("OAuth token missing; run login first")
-    credentials = Credentials.from_authorized_user_file(str(path), SCOPES)
+    path, info = read_token(base)
+    # Refresh with the scopes already granted. Passing the expanded SCOPES list
+    # would break refresh for a token saved before export-stats existed.
+    credentials = Credentials.from_authorized_user_info(
+        info, info.get("scopes") or list(SCOPES)
+    )
     return AuthorizedSession(credentials), lambda: atomic_json(
         path, json.loads(credentials.to_json())
     )
