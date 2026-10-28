@@ -127,9 +127,19 @@ class Runner:
             return
         if job.get("video_id"):
             remote = self.youtube.inspect(job["video_id"])
-            self.note_progress(job)
             status = remote["status"]
             processing = remote.get("processingDetails", {}).get("processingStatus")
+            observed = {
+                "privacy": status.get("privacyStatus"),
+                "upload": status.get("uploadStatus"),
+                "processing": processing,
+                "publish_at": status.get("publishAt"),
+            }
+            # A read is not progress. Reset only when the remote phase changes.
+            previous = job.get("remote_stage")
+            if previous is not None and previous != observed:
+                self.note_progress(job)
+            job["remote_stage"] = observed
             job["processing_status"] = processing
             if status.get("privacyStatus") == "public":
                 job["stage"] = "published"
@@ -226,14 +236,17 @@ class Runner:
                 else "Network failure; session will be reconciled"
             )
             if transient and job["consecutive_failures"] < 10:
+                retry_after = getattr(error, "retry_after", 0)
                 delay = max(
-                    getattr(error, "retry_after", 0),
+                    retry_after,
                     min(3600, 30 * 2 ** min(job["consecutive_failures"], 7))
                     + random.uniform(0, 10),
                 )
                 remaining = self.seconds_before_schedule_margin(record, role)
-                if remaining > 0:
-                    delay = min(delay, remaining)
+                # Stay at least as long as Retry-After. A sub-second window
+                # would busy-loop, so leave the normal backoff in place.
+                if remaining >= 1:
+                    delay = max(retry_after, min(delay, remaining))
                 job["next_retry"] = (
                     self.clock() + timedelta(seconds=delay)
                 ).isoformat()
