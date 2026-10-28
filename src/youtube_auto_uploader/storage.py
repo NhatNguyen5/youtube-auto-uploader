@@ -105,3 +105,27 @@ def validate_story_state(story):
             raise ValueError("Invalid source identity")
         if not isinstance(job.get("attempts"), int) or job["attempts"] < 0:
             raise ValueError("Invalid attempt count")
+        if "log_recorded" in job and not isinstance(job["log_recorded"], bool):
+            raise ValueError("Invalid upload log flag")
+
+
+def upload_log_job_id(channel_id, story_id, role):
+    return f"{channel_id}/{story_id}/{role}"
+
+
+def upload_log_outcome(job):
+    """Return (status, error) for one finished upload attempt, or None.
+
+    Local state decides whether YouTube already has the video. A saved
+    video_id must not be uploaded again. Missed deadlines and transfers
+    still in progress are not log lines.
+    """
+    stage = job.get("stage")
+    video_id = job.get("video_id") or ""
+    if video_id and stage == "failed":
+        return "failed", job.get("error") or ""
+    if video_id:
+        return "uploaded", ""
+    if stage in {"failed", "needs_review"} and job.get("session"):
+        return stage, job.get("error") or ""
+    return None

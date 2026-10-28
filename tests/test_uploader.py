@@ -9,10 +9,21 @@ import portalocker
 import pytest
 import requests
 
-from youtube_auto_uploader.drive import Drive
+from youtube_auto_uploader.drive import (
+    UPLOAD_LOG_NAME,
+    Drive,
+    format_upload_log_record,
+    merge_upload_log,
+)
+from youtube_auto_uploader.google_auth import SCOPES, scopes_for_refresh
 from youtube_auto_uploader.models import Settings, Story
 from youtube_auto_uploader.runner import Runner
-from youtube_auto_uploader.storage import Store, atomic_json, parse_json
+from youtube_auto_uploader.storage import (
+    Store,
+    atomic_json,
+    parse_json,
+    upload_log_outcome,
+)
 from youtube_auto_uploader.youtube import NeedsReview, YouTube
 
 NOW = datetime(2026, 10, 17, tzinfo=UTC)
@@ -75,10 +86,49 @@ def setup(tmp_path):
     return runner, store, drive, youtube
 
 
-def response(status, data=None, headers=None):
+def response(status, data=None, headers=None, content=b""):
     result = Mock(status_code=status, headers=headers or {})
     result.json.return_value = data or {}
+    if isinstance(content, str):
+        content = content.encode()
+    result.content = content
     return result
+
+
+def attach_log(runner, drive):
+    runner.settings.upload_log_folder_id = "log-folder"
+    log = {"text": ""}
+
+    def append(folder, record):
+        assert folder == "log-folder"
+        merged = merge_upload_log(log["text"], record)
+        if merged is None:
+            return False
+        log["text"] = merged
+        return True
+
+    drive.append_upload_log.side_effect = append
+    return log
+
+
+def log_lines(log):
+    return [json.loads(line) for line in log["text"].splitlines() if line.strip()]
+
+
+def log_record(**overrides):
+    record = {
+        "schema_version": 1,
+        "date": NOW.isoformat(),
+        "channel": "channel",
+        "source_file": "long.mp4",
+        "source_file_id": "long",
+        "video_id": "yt-long",
+        "status": "uploaded",
+        "error": "",
+        "job_id": "channel/story/long",
+    }
+    record.update(overrides)
+    return record
 
 
 def test_duplicate_json_keys():
@@ -353,6 +403,237 @@ def test_changed_source_stops_download(tmp_path):
     with pytest.raises(ValueError, match="changed"):
         drive.download(source("long"), tmp_path / "video")
     drive.http.get.assert_not_called()
+
+
+def test_upload_log_outcome_matches_saved_upload():
+    assert upload_log_outcome({"stage": "uploaded", "video_id": "abc"}) == (
+        "uploaded",
+        "",
+    )
+    assert upload_log_outcome({"stage": "scheduled", "video_id": "abc"}) == (
+        "uploaded",
+        "",
+    )
+    assert upload_log_outcome(
+        {"stage": "failed", "video_id": "abc", "error": "rejected"}
+    ) == ("failed", "rejected")
+    assert upload_log_outcome(
+        {"stage": "needs_review", "video_id": "abc", "error": "schedule removed"}
+    ) == ("uploaded", "")
+    assert upload_log_outcome(
+        {"stage": "needs_review", "session": "https://upload", "error": "expired"}
+    ) == ("needs_review", "expired")
+    assert (
+        upload_log_outcome({"stage": "uploading", "session": "https://upload"}) is None
+    )
+    assert upload_log_outcome({"stage": "missed"}) is None
+    assert upload_log_outcome({"stage": "needs_review", "error": "validation"}) is None
+
+
+def test_corrupt_log_flag_rejected(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    job = runner.state["stories"]["story"]["jobs"]["long"]
+    job.update(stage="uploaded", video_id="yt-long", log_recorded="yes")
+    store.save(runner.state)
+    with pytest.raises(ValueError, match="upload log"):
+        store.load()
+
+
+def test_same_job_twice_writes_one_log_line_and_uploads_once(setup):
+    runner, store, drive, youtube = setup
+    log = attach_log(runner, drive)
+    runner.discover()
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "private", "uploadStatus": "uploaded"},
+        "processingDetails": {"processingStatus": "processing"},
+    }
+
+    def transfer(job, path, save):
+        job.update(stage="uploaded", video_id="yt-long")
+        save()
+
+    youtube.transfer.side_effect = transfer
+    runner.process("story", "long", runner.state["stories"]["story"])
+    restarted = Runner(
+        runner.settings,
+        runner.base,
+        store,
+        drive,
+        youtube,
+        report=lambda text: None,
+        clock=lambda: NOW,
+    )
+    restarted.process("story", "long", restarted.state["stories"]["story"])
+    # Crash after Drive stored the line and before local confirmation.
+    restarted.state["stories"]["story"]["jobs"]["long"].pop("log_recorded")
+    restarted.process("story", "long", restarted.state["stories"]["story"])
+    assert youtube.start.call_count == 1
+    assert youtube.transfer.call_count == 1
+    assert youtube.start.call_args.args[1]["id"] == "long"
+    assert log_lines(log) == [log_record()]
+    assert store.load()["stories"]["story"]["jobs"]["long"]["log_recorded"] is True
+
+
+def test_failed_upload_attempt_is_logged_once(setup):
+    runner, store, drive, youtube = setup
+    log = attach_log(runner, drive)
+    runner.discover()
+
+    def transfer(job, path, save):
+        raise NeedsReview("Upload session unavailable; reconcile before retrying")
+
+    youtube.transfer.side_effect = transfer
+    record = runner.state["stories"]["story"]
+    runner.process("story", "long", record)
+    runner.process("story", "long", record)
+    lines = log_lines(log)
+    assert len(lines) == 1
+    assert lines[0]["status"] == "needs_review"
+    assert lines[0]["video_id"] == ""
+    assert lines[0]["error"] == "Upload session unavailable; reconcile before retrying"
+    assert lines[0]["channel"] == "channel"
+    assert lines[0]["source_file"] == "long.mp4"
+    assert youtube.start.call_count == 1
+    assert youtube.transfer.call_count == 1
+
+
+def test_log_failure_does_not_lose_or_repeat_upload(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    log = attach_log(runner, drive)
+    real_append = drive.append_upload_log.side_effect
+    secret = "https://secret.example/token"
+
+    def flaky(folder, record):
+        if flaky.failed:
+            flaky.failed = False
+            raise requests.ConnectionError(secret)
+        return real_append(folder, record)
+
+    flaky.failed = True
+    drive.append_upload_log.side_effect = flaky
+    runner.discover()
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "private", "uploadStatus": "uploaded"},
+        "processingDetails": {"processingStatus": "processing"},
+    }
+
+    def transfer(job, path, save):
+        job.update(stage="uploaded", video_id="yt-long")
+        save()
+
+    youtube.transfer.side_effect = transfer
+    record = runner.state["stories"]["story"]
+    runner.process("story", "long", record)
+    saved = store.load()["stories"]["story"]["jobs"]["long"]
+    assert saved["video_id"] == "yt-long"
+    assert saved["stage"] == "uploaded"
+    assert not saved.get("log_recorded")
+    assert saved["log_error"] == "Network failure"
+    assert secret not in saved["log_error"]
+    assert log["text"] == ""
+    assert any("upload log failed" in line for line in reports)
+    assert all(secret not in line for line in reports)
+    runner.process("story", "long", record)
+    assert youtube.start.call_count == 1
+    assert youtube.transfer.call_count == 1
+    assert log_lines(log) == [log_record()]
+    assert store.load()["stories"]["story"]["jobs"]["long"]["log_recorded"] is True
+    assert "log_error" not in store.load()["stories"]["story"]["jobs"]["long"]
+
+
+def test_upload_log_line_escapes_error_text():
+    error = 'comma, quote " and\nnewline'
+    line = format_upload_log_record(
+        log_record(status="needs_review", video_id="", error=error)
+    )
+    assert "\n" not in line
+    assert json.loads(line)["error"] == error
+
+
+def test_merge_upload_log_keeps_first_outcome_and_unparsed_lines():
+    original = merge_upload_log("not-json\n", log_record())
+    assert original.startswith("not-json\n")
+    assert (
+        merge_upload_log(original, log_record(status="failed", error="later")) is None
+    )
+    added = merge_upload_log(original, log_record(job_id="channel/story/short"))
+    assert len([line for line in added.splitlines() if line.strip()]) == 3
+
+
+def test_drive_upload_log_append_is_idempotent():
+    http = Mock()
+    store = {"body": None, "id": None}
+
+    def get(url, params=None, **kwargs):
+        if params and params.get("alt") == "media":
+            return response(200, content=store["body"] or "")
+        files = []
+        if store["id"]:
+            files.append(
+                {
+                    "id": store["id"],
+                    "name": UPLOAD_LOG_NAME,
+                    "mimeType": "text/plain",
+                }
+            )
+        return response(200, {"files": files})
+
+    def post(url, params=None, json=None, **kwargs):
+        assert json["name"] == UPLOAD_LOG_NAME
+        assert json["parents"] == ["folder"]
+        store["id"] = "file-1"
+        store["body"] = ""
+        return response(200, {"id": "file-1"})
+
+    def patch(url, params=None, data=None, **kwargs):
+        store["body"] = data.decode("utf-8")
+        return response(200, {"id": store["id"]})
+
+    http.get.side_effect = get
+    http.post.side_effect = post
+    http.patch.side_effect = patch
+    drive = Drive(http)
+    record = log_record()
+    assert drive.append_upload_log("folder", record) is True
+    assert drive.append_upload_log("folder", record) is False
+    assert (
+        drive.append_upload_log("folder", log_record(status="failed", error="later"))
+        is False
+    )
+    lines = [ln for ln in store["body"].splitlines() if ln]
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == record
+    assert http.post.call_count == 1
+    assert http.patch.call_count == 1
+
+
+def test_duplicate_upload_logs_rejected():
+    http = Mock()
+    http.get.return_value = response(
+        200,
+        {
+            "files": [
+                {"id": "a", "name": UPLOAD_LOG_NAME, "mimeType": "text/plain"},
+                {"id": "b", "name": UPLOAD_LOG_NAME, "mimeType": "text/plain"},
+            ]
+        },
+    )
+    with pytest.raises(ValueError, match="found 2"):
+        Drive(http).append_upload_log("folder", log_record())
+
+
+def test_old_token_refresh_does_not_request_new_drive_scope():
+    old = [
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/youtube.force-ssl",
+    ]
+    refreshed = scopes_for_refresh(old)
+    assert "https://www.googleapis.com/auth/drive.file" not in refreshed
+    assert set(refreshed) == set(old)
+    assert set(scopes_for_refresh(SCOPES)) == set(SCOPES)
 
 
 def test_incomplete_session_no_progress_does_not_loop(tmp_path):

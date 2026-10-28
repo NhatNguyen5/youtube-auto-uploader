@@ -11,6 +11,8 @@ class Model(BaseModel):
 class Settings(Model):
     schema_version: Literal[1] = 1
     drive_folder_id: str = "1RUg3Mlt9JKHBGEdjE-VMJfB2nmNnq8SE"
+    # Empty disables the Drive upload log. Story folders are never written.
+    upload_log_folder_id: str = ""
     youtube_channel_id: str
     upload_lead_minutes: int = Field(default=180, gt=0)
     poll_seconds: int = Field(default=30, ge=5)

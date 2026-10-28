@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from .drive import ApiError
 from .models import Story
+from .storage import upload_log_job_id, upload_log_outcome
 from .youtube import NeedsReview
 
 
@@ -205,6 +206,52 @@ class Runner:
             self.save()
         # Storage/OAuth errors deliberately propagate: do not continue remote work.
         self.report(f"{sid}/{role}: {job['stage']}")
+        self.record_upload_log(sid, role, record)
+
+    def record_upload_log(self, sid, role, record):
+        # Called only after local state already has the video id or terminal
+        # failure. A log error must not clear that result or start another upload.
+        folder = self.settings.upload_log_folder_id
+        if not folder:
+            return
+        job = record["jobs"][role]
+        if job.get("log_recorded"):
+            return
+        outcome = upload_log_outcome(job)
+        if outcome is None:
+            return
+        status, message = outcome
+        if not job.get("log_date"):
+            job["log_date"] = self.clock().isoformat()
+            self.save()
+        video = Story.model_validate(record["snapshot"]).videos[role]
+        payload = {
+            "schema_version": 1,
+            "date": job["log_date"],
+            "channel": self.settings.youtube_channel_id,
+            "source_file": job["source"].get("name") or video.filename,
+            "source_file_id": job["source"].get("id", ""),
+            "video_id": job.get("video_id") or "",
+            "status": status,
+            "error": message,
+            "job_id": upload_log_job_id(self.settings.youtube_channel_id, sid, role),
+        }
+        try:
+            self.drive.append_upload_log(folder, payload)
+        except requests.RequestException:
+            self._report_log_failure(sid, role, job, "Network failure")
+            return
+        except (ApiError, ValueError) as exc:
+            self._report_log_failure(sid, role, job, str(exc))
+            return
+        job["log_recorded"] = True
+        job.pop("log_error", None)
+        self.save()
+
+    def _report_log_failure(self, sid, role, job, detail):
+        job["log_error"] = detail
+        self.save()
+        self.report(f"{sid}/{role}: upload log failed ({detail})")
 
     def reconcile_uploaded(self):
         for sid, record in list(self.state["stories"].items()):
