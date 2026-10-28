@@ -655,7 +655,7 @@ def ensure_reach_job(http, state):
     return jobs[0]["id"]
 
 
-def sync_reach(http, state):
+def sync_reach(http, state, path):
     job_id = ensure_reach_job(http, state)
     reports = paged(http, f"{REPORTING}/jobs/{job_id}/reports", "reports")
     reports.sort(key=lambda report: parse_timestamp(report["createTime"]))
@@ -668,6 +668,9 @@ def sync_reach(http, state):
         ):
             continue
         apply_reach_report(state, report, download_report(http, report["downloadUrl"]))
+        # Record this day before the next download. A later failure must leave
+        # the reports already ingested on disk for the next run.
+        atomic_json(path, state)
 
 
 def cell(value):
@@ -859,7 +862,7 @@ def export_locked(targets, path, http, moment, week):
     for target in targets:
         youtube.verify_channel(target.youtube_channel_id)
     state = load_reach(path)
-    sync_reach(http, state)
+    sync_reach(http, state, path)
     atomic_json(path, state)
     drive = Drive(http)
     today = pacific_date(moment)

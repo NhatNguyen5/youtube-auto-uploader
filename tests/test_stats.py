@@ -12,7 +12,7 @@ import pytest
 
 from youtube_auto_uploader import google_auth
 from youtube_auto_uploader.cli import main
-from youtube_auto_uploader.drive import STATS_EXPORTER, Drive
+from youtube_auto_uploader.drive import STATS_EXPORTER, ApiError, Drive
 from youtube_auto_uploader.models import Settings, StatsChannel
 from youtube_auto_uploader.stats import (
     PACIFIC,
@@ -622,6 +622,72 @@ def test_export_stats_rerun_keeps_one_file_and_one_row(tmp_path):
     assert ("2026-06-01", "2026-06-04") in http.retention
     # A second pass of the same report must not be appended to the CSV.
     assert http.files["stats-file"]["csv"].decode().count("video1") == 1
+
+
+def test_failed_download_keeps_ingested_reach_days(tmp_path):
+    settings = Settings(
+        youtube_channel_id="UCchannel",
+        stats_drive_folder_id="statsfolder",
+        stats_state_path="reach.json",
+    )
+
+    def history(root):
+        return json.loads((root / "reach.json").read_text(encoding="utf-8"))
+
+    clean_root = tmp_path / "clean"
+    clean_root.mkdir()
+    clean_http = Api()
+    clean = export_stats(settings, clean_root, clean_http, clock=lambda: MOMENT)
+
+    partial_root = tmp_path / "partial"
+    partial_root.mkdir()
+    reach_path = partial_root / "reach.json"
+
+    class FailSecondDownload(Api):
+        def __init__(self):
+            super().__init__()
+            self.media_attempts = 0
+            self.fail_second = True
+
+        def get(self, url, params=None, timeout=None, headers=None):
+            if urlparse(url).path.startswith("/v1/media/"):
+                self.media_attempts += 1
+                if self.fail_second and self.media_attempts == 2:
+                    stored = json.loads(reach_path.read_text(encoding="utf-8"))
+                    assert set(stored["days"]) == {"2026-06-01"}
+                    report_id = urlparse(url).path.rsplit("/", 1)[-1]
+                    self.downloads.append(report_id)
+                    failed = Mock(status_code=503, headers={})
+                    failed.json.return_value = {
+                        "error": {"errors": [{"reason": "backendError"}]}
+                    }
+                    return failed
+            return super().get(url, params=params, timeout=timeout, headers=headers)
+
+    partial_http = FailSecondDownload()
+    with pytest.raises(ApiError, match="backendError"):
+        export_stats(settings, partial_root, partial_http, clock=lambda: MOMENT)
+
+    stored = history(partial_root)
+    assert list(stored["days"]) == ["2026-06-01"]
+    assert stored["days"]["2026-06-01"]["report_id"] == "report-2026-06-01"
+    assert stored["days"]["2026-06-01"]["videos"]["video1"]["impressions"] == 100
+    assert partial_http.downloads == ["report-2026-06-01", "report-2026-06-02"]
+    assert partial_http.created == []
+    assert list(partial_root.glob(".write-*")) == []
+
+    partial_http.fail_second = False
+    rerun = export_stats(settings, partial_root, partial_http, clock=lambda: MOMENT)
+    assert history(partial_root)["days"] == history(clean_root)["days"]
+    assert (
+        partial_http.files["stats-file"]["csv"] == clean_http.files["stats-file"]["csv"]
+    )
+    assert rerun == clean
+    assert partial_http.downloads.count("report-2026-06-01") == 1
+    assert (
+        history(partial_root)["days"]["2026-06-02"]["videos"]["video1"]["impressions"]
+        == 40
+    )
 
 
 def test_export_stats_cli_requires_configuration(tmp_path, monkeypatch, capsys):
