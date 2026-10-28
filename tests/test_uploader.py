@@ -11,7 +11,7 @@ import requests
 
 from youtube_auto_uploader.drive import ApiError, Drive
 from youtube_auto_uploader.models import Settings, Story
-from youtube_auto_uploader.runner import Runner
+from youtube_auto_uploader.runner import Runner, poll_retry, scheduled_delay
 from youtube_auto_uploader.storage import Store, atomic_json, parse_json
 from youtube_auto_uploader.youtube import NeedsReview, YouTube
 
@@ -595,3 +595,240 @@ def test_incomplete_session_no_progress_does_not_loop(tmp_path):
             {"source": source("long"), "session": SESSION}, path, lambda: None
         )
     assert http.put.call_count == 2
+
+
+def _due_snapshot(runner, hours):
+    runner.settings.upload_lead_minutes = 24 * 60
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    later = (NOW + timedelta(hours=hours)).isoformat()
+    for video in record["snapshot"]["videos"].values():
+        video["publish_at"] = later
+    return record
+
+
+@pytest.mark.parametrize("reason", ["quotaExceeded", "dailyLimitExceeded"])
+def test_quota_403_retries_upload_after_reset(setup, reason):
+    runner, store, drive, youtube = setup
+    record = _due_snapshot(runner, 8)
+
+    def start(video, source):
+        if runner.clock() == NOW:
+            raise ApiError(403, reason)
+        return SESSION
+
+    youtube.start.side_effect = start
+    runner.cycle()
+    for job in record["jobs"].values():
+        assert job["stage"] != "needs_review"
+        assert reason in job["error"]
+        assert job["attempts"] == 0
+        assert datetime.fromisoformat(job["next_retry"]) == datetime(
+            2026, 10, 17, 7, tzinfo=UTC
+        )
+    youtube.start.reset_mock()
+    retry_at = datetime.fromisoformat(record["jobs"]["long"]["next_retry"])
+    runner.clock = lambda: retry_at
+    runner.cycle()
+    assert youtube.start.called
+
+
+@pytest.mark.parametrize(
+    "reason", ["rateLimitExceeded", "userRateLimitExceeded", "backendError"]
+)
+def test_transient_403_retries_download_after_backoff(setup, reason):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    original = drive.download.side_effect
+
+    def download(src, path):
+        if runner.clock() == NOW:
+            raise ApiError(403, reason)
+        return original(src, path)
+
+    drive.download.side_effect = download
+    runner.cycle()
+    job = record["jobs"]["long"]
+    assert job["stage"] != "needs_review"
+    assert reason in job["error"]
+    assert job["attempts"] == 1
+    assert job["next_retry"]
+    publish_at = Story.model_validate(record["snapshot"]).videos["long"].publish_at
+    retry_at = datetime.fromisoformat(job["next_retry"])
+    assert NOW < retry_at < publish_at
+    drive.download.reset_mock()
+    runner.clock = lambda: retry_at
+    runner.cycle()
+    assert drive.download.called
+
+
+def test_quota_403_gives_up_after_publish_deadline(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    youtube.start.side_effect = ApiError(403, "quotaExceeded")
+    runner.cycle()
+    job = record["jobs"]["long"]
+    assert job["stage"] != "needs_review"
+    assert job["next_retry"]
+    assert job["attempts"] == 0
+    youtube.start.reset_mock()
+    runner.clock = lambda: datetime.fromisoformat(job["next_retry"])
+    runner.cycle()
+    assert job["stage"] == "missed"
+    youtube.start.assert_not_called()
+
+
+def test_quota_403_misses_unstarted_job_already_past_deadline(setup, monkeypatch):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+
+    def explode(sid, role, rec):
+        runner.clock = lambda: NOW + timedelta(hours=2)
+        raise ApiError(403, "quotaExceeded")
+
+    monkeypatch.setattr(runner, "step", explode)
+    runner.process("story", "long", record)
+    job = record["jobs"]["long"]
+    assert job["stage"] == "missed"
+    assert job["attempts"] == 0
+    assert not job.get("next_retry")
+
+
+def test_quota_on_uploaded_video_waits_past_deadline(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    job = record["jobs"]["long"]
+    job.update(stage="uploaded", video_id="known", attempts=2)
+    youtube.inspect.side_effect = ApiError(403, "quotaExceeded")
+    moment = NOW + timedelta(hours=2)
+    runner.clock = lambda: moment
+    runner.process("story", "long", record)
+    assert job["stage"] == "uploaded"
+    assert job["attempts"] == 2
+    assert datetime.fromisoformat(job["next_retry"]) == datetime(
+        2026, 10, 17, 7, tzinfo=UTC
+    )
+    youtube.inspect.reset_mock()
+    runner.clock = lambda: datetime.fromisoformat(job["next_retry"])
+    youtube.inspect.side_effect = lambda video_id: {
+        "status": {"privacyStatus": "public", "uploadStatus": "processed"}
+    }
+    runner.cycle()
+    assert youtube.inspect.called
+    assert job["stage"] == "published"
+
+
+def test_permission_403_needs_review(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    drive.download.side_effect = ApiError(403, "forbidden")
+    runner.process("story", "long", record)
+    job = record["jobs"]["long"]
+    assert job["stage"] == "needs_review"
+    assert job["attempts"] == 1
+    assert not job.get("next_retry")
+
+
+def test_429_retry_after_is_a_floor_above_the_cap(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    later = (NOW + timedelta(hours=3)).isoformat()
+    for video in record["snapshot"]["videos"].values():
+        video["publish_at"] = later
+    original = drive.download.side_effect
+
+    def download(src, path):
+        if runner.clock() == NOW:
+            raise ApiError(429, "rateLimitExceeded", retry_after=7200)
+        return original(src, path)
+
+    drive.download.side_effect = download
+    runner.cycle()
+    job = record["jobs"]["long"]
+    assert job["stage"] != "needs_review"
+    assert job["next_retry"]
+    retry_at = datetime.fromisoformat(job["next_retry"])
+    assert retry_at - NOW >= timedelta(seconds=7200)
+    assert retry_at < NOW + timedelta(hours=3)
+    drive.download.reset_mock()
+    runner.clock = lambda: retry_at
+    runner.cycle()
+    assert drive.download.called
+
+
+def test_quota_wait_never_retries_in_under_a_second(setup):
+    runner, store, drive, youtube = setup
+    record = _due_snapshot(runner, 8)
+    reset = datetime(2026, 10, 17, 7, tzinfo=UTC)
+    almost = reset - timedelta(milliseconds=200)
+    runner.clock = lambda: almost
+
+    def start(video, source):
+        if runner.clock() < reset:
+            raise ApiError(403, "quotaExceeded", retry_after=0.4)
+        return SESSION
+
+    youtube.start.side_effect = start
+    runner.cycle()
+    job = record["jobs"]["long"]
+    assert job["stage"] != "needs_review"
+    assert job["attempts"] == 0
+    retry_at = datetime.fromisoformat(job["next_retry"])
+    assert retry_at - almost >= timedelta(seconds=1)
+    assert retry_at - almost >= timedelta(seconds=0.4)
+    youtube.start.reset_mock()
+    runner.clock = lambda: retry_at
+    runner.cycle()
+    assert youtube.start.called
+
+
+def test_scheduled_delay_keeps_retry_after_and_one_second():
+    assert scheduled_delay(0.2, 0) >= 1
+    assert scheduled_delay(0.2, 0.4) >= 1
+    assert scheduled_delay(10, 0.4) >= 10
+    assert scheduled_delay(min(3600, 30 * 2**9), 7200) >= 7200
+    assert scheduled_delay(100, 2.5) >= 2.5
+
+
+def test_poll_retry_classifies_quota_and_rate_limits():
+    action, failures, wait = poll_retry(ApiError(403, "quotaExceeded"), 9, False, NOW)
+    assert action == "quota"
+    assert failures == 9
+    assert wait == timedelta(hours=7).total_seconds()
+    assert poll_retry(ApiError(403, "dailyLimitExceeded"), 0, True, NOW)[0] == "stop"
+    action, failures, _wait = poll_retry(
+        ApiError(403, "rateLimitExceeded"), 0, False, NOW
+    )
+    assert action == "transient"
+    assert failures == 1
+    assert poll_retry(ApiError(403, "userRateLimitExceeded"), 0, False, NOW)[0] == (
+        "transient"
+    )
+    assert poll_retry(ApiError(403, "backendError"), 0, False, NOW)[0] == "transient"
+    assert poll_retry(ApiError(429, "rateLimitExceeded"), 0, False, NOW)[0] == (
+        "transient"
+    )
+    assert poll_retry(ApiError(403, "forbidden"), 0, False, NOW)[0] == "stop"
+    assert poll_retry(requests.ConnectionError("down"), 0, False, NOW)[0] == (
+        "transient"
+    )
+    assert poll_retry(ApiError(503, "backendError"), 9, False, NOW)[0] == "stop"
+    action, failures, wait = poll_retry(
+        ApiError(429, "rateLimitExceeded", retry_after=7200), 8, False, NOW
+    )
+    assert action == "transient"
+    assert failures == 9
+    assert wait >= 7200
+    almost = datetime(2026, 10, 17, 7, tzinfo=UTC) - timedelta(milliseconds=200)
+    action, failures, wait = poll_retry(
+        ApiError(403, "quotaExceeded", retry_after=0.4), 4, False, almost
+    )
+    assert action == "quota"
+    assert failures == 4
+    assert wait >= 1

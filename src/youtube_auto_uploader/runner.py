@@ -1,6 +1,7 @@
 import hashlib
 import random
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from pydantic import ValidationError
@@ -9,9 +10,57 @@ from .drive import ApiError
 from .models import Story
 from .youtube import NeedsReview
 
+PACIFIC = ZoneInfo("America/Los_Angeles")
+TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+TRANSIENT_REASONS = {
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "backendError",
+}
+QUOTA_REASONS = {"quotaExceeded", "dailyLimitExceeded"}
+
 
 def now():
     return datetime.now(UTC)
+
+
+def next_quota_reset(moment):
+    # YouTube quota resets at midnight Pacific time.
+    local = moment.astimezone(PACIFIC)
+    reset = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if reset <= local:
+        reset += timedelta(days=1)
+    return reset.astimezone(UTC)
+
+
+def error_kind(error):
+    if isinstance(error, ApiError):
+        if error.reason in QUOTA_REASONS:
+            return "quota"
+        if error.status in TRANSIENT_STATUSES or error.reason in TRANSIENT_REASONS:
+            return "transient"
+        return "fatal"
+    if isinstance(error, requests.RequestException):
+        return "transient"
+    return "fatal"
+
+
+def scheduled_delay(computed, retry_after=0):
+    # Retry-After is a floor the cap must not undercut. Never wait under a second.
+    return max(float(computed), float(retry_after or 0), 1.0)
+
+
+def poll_retry(error, failures, once, moment, poll_seconds=30):
+    kind = error_kind(error)
+    retry_after = getattr(error, "retry_after", 0)
+    if kind == "quota" and not once:
+        wait = (next_quota_reset(moment) - moment).total_seconds()
+        return "quota", failures, scheduled_delay(wait, retry_after)
+    failures += 1
+    if once or kind != "transient" or failures >= 10:
+        return "stop", failures, 0.0
+    computed = max(poll_seconds, min(3600, 30 * 2**failures))
+    return "transient", failures, scheduled_delay(computed, retry_after)
 
 
 class Runner:
@@ -236,31 +285,46 @@ class Runner:
             job.update(stage="needs_review", error=str(error))
             self.save()
         except (ApiError, requests.RequestException) as error:
-            job["attempts"] += 1
-            job["consecutive_failures"] = job.get("consecutive_failures", 0) + 1
-            transient = isinstance(
-                error, requests.RequestException
-            ) or error.status in {429, 500, 502, 503, 504}
+            kind = error_kind(error)
+            # Quota resets on a clock, so it must not burn the attempt or streak.
+            if kind != "quota":
+                job["attempts"] += 1
+                job["consecutive_failures"] = job.get("consecutive_failures", 0) + 1
             job["error"] = (
                 str(error)
                 if isinstance(error, ApiError)
                 else "Network failure; session will be reconciled"
             )
-            if transient and job["consecutive_failures"] < 10:
-                retry_after = getattr(error, "retry_after", 0)
-                delay = max(
-                    retry_after,
-                    min(3600, 30 * 2 ** min(job["consecutive_failures"], 7))
-                    + random.uniform(0, 10),
+            if kind == "quota":
+                publish_at = (
+                    Story.model_validate(record["snapshot"]).videos[role].publish_at
                 )
+                if (
+                    self.clock() >= publish_at
+                    and not job.get("video_id")
+                    and not job.get("session")
+                ):
+                    job["stage"] = "missed"
+                    job.pop("next_retry", None)
+                else:
+                    moment = self.clock()
+                    until_reset = (next_quota_reset(moment) - moment).total_seconds()
+                    delay = scheduled_delay(
+                        until_reset, getattr(error, "retry_after", 0)
+                    )
+                    job["next_retry"] = (moment + timedelta(seconds=delay)).isoformat()
+            elif kind == "transient" and job.get("consecutive_failures", 0) < 10:
+                retry_after = getattr(error, "retry_after", 0)
+                grown = 30 * 2 ** min(job["consecutive_failures"], 7)
+                delay = max(retry_after, min(3600, grown) + random.uniform(0, 10))
                 remaining = self.seconds_before_schedule_margin(record, role)
                 # Stay at least as long as Retry-After. A sub-second window
                 # would busy-loop, so leave the normal backoff in place.
                 if remaining >= 1:
                     delay = max(retry_after, min(delay, remaining))
-                job["next_retry"] = (
-                    self.clock() + timedelta(seconds=delay)
-                ).isoformat()
+                delay = scheduled_delay(delay, retry_after)
+                moment = self.clock()
+                job["next_retry"] = (moment + timedelta(seconds=delay)).isoformat()
             else:
                 job["stage"] = "needs_review"
             self.save()
