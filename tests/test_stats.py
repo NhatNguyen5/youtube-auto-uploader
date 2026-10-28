@@ -20,7 +20,9 @@ from youtube_auto_uploader.stats import (
     analytics_rows,
     apply_reach_report,
     canonical_week,
+    cell,
     export_stats,
+    parse_reach_csv,
     publication_time,
     reach_summary,
     report_is_newer,
@@ -106,6 +108,42 @@ def test_aggregate_window_prorates_trailing_day_and_skips_unready_days():
     assert partial["views"] == pytest.approx(150)
     assert partial["days"][-1]["included"] is False
     assert aggregate_window(window, rows, None)["views"] is None
+
+
+def test_reach_fixture_accepts_bulk_yyyymmdd_and_ratio_ctr():
+    text = Path("tests/fixtures/channel_reach_basic_a1.csv").read_text(encoding="utf-8")
+    rows = parse_reach_csv(text)
+    assert [row["video_id"] for row in rows] == ["video1"]
+    assert rows[0]["date"] == "2026-06-01"
+    assert rows[0]["impressions"] == 293
+    assert rows[0]["ctr"] == pytest.approx(0.0443)
+    state = {"days": {}}
+    apply_reach_report(
+        state,
+        {
+            "id": "reach-1",
+            "startTime": "2026-06-01T07:00:00Z",
+            "createTime": "2026-06-03T00:00:00Z",
+        },
+        text,
+    )
+    assert state["days"]["2026-06-01"]["videos"]["video1"]["impressions"] == 293
+    percent = parse_reach_csv(
+        "date,channel_id,video_id,video_thumbnail_impressions,"
+        "video_thumbnail_impressions_ctr\n"
+        "2026-06-01,UCchannel,video1,293,4.43\n"
+    )
+    assert percent[0]["ctr"] == pytest.approx(0.0443)
+    assert percent[0]["date"] == "2026-06-01"
+
+
+def test_cell_guards_formula_injection():
+    assert cell("=HYPERLINK()") == "'=HYPERLINK()"
+    assert cell("+1+1") == "'+1+1"
+    assert cell("-2+3") == "'-2+3"
+    assert cell("@SUM(A1)") == "'@SUM(A1)"
+    assert cell("Night story") == "Night story"
+    assert cell(200) == "200"
 
 
 def test_reach_ingest_replaces_a_day_instead_of_adding():
@@ -354,7 +392,7 @@ class Api:
             self.csv_by_id[report_id] = (
                 "date,channel_id,video_id,video_thumbnail_impressions,"
                 "video_thumbnail_impressions_ctr\n"
-                f"{day},UCchannel,video1,{impressions},{ctr}\n"
+                f"{day.replace('-', '')},UCchannel,video1,{impressions},{ctr}\n"
             )
 
     def get(self, url, params=None, timeout=None, headers=None):
@@ -426,12 +464,10 @@ class Api:
 
     def analytics(self, params):
         dimensions = params.get("dimensions")
-        if dimensions == "day":
-            if int(params.get("startIndex", 1)) > 1:
-                return {
-                    "columnHeaders": [{"name": "day"}],
-                    "rows": [],
-                }
+        filters = params.get("filters")
+        if dimensions in {"video", "day,video"}:
+            raise AssertionError(dimensions)
+        if dimensions == "day" and not filters:
             return {
                 "columnHeaders": [
                     {"name": "day"},
@@ -441,29 +477,27 @@ class Api:
                 ],
                 "rows": [["2026-06-10", 1, 1, 0]],
             }
-        if dimensions == "video":
+        if not dimensions and filters == "video==video1":
             return {
                 "columnHeaders": [
-                    {"name": "video"},
                     {"name": "views"},
                     {"name": "averageViewDuration"},
                     {"name": "subscribersGained"},
                 ],
-                "rows": [["video1", 1000, 30, 7]],
+                "rows": [[1000, 30, 7]],
             }
-        if dimensions == "day,video":
+        if dimensions == "day" and filters == "video==video1":
             return {
                 "columnHeaders": [
                     {"name": "day"},
-                    {"name": "video"},
                     {"name": "views"},
                     {"name": "averageViewDuration"},
                     {"name": "subscribersGained"},
                 ],
                 "rows": [
-                    ["2026-06-01", "video1", 100, 10, 2],
-                    ["2026-06-02", "video1", 50, 20, 1],
-                    ["2026-06-04", "video1", 80, 5, 4],
+                    ["2026-06-01", 100, 10, 2],
+                    ["2026-06-02", 50, 20, 1],
+                    ["2026-06-04", 80, 5, 4],
                 ],
             }
         if dimensions == "elapsedVideoTimeRatio":

@@ -30,7 +30,9 @@ ACTIVITY_API = (
 REACH_API = (
     "YouTube Reporting API channel_reach_basic_a1: "
     "video_thumbnail_impressions and video_thumbnail_impressions_ctr. "
-    "Thumbnail impressions and CTR are not in the Analytics API."
+    "Thumbnail impressions and CTR are not in the Analytics API. "
+    "CTR is clicks divided by impressions (0.0443 means 4.43%), not a 0-100 number. "
+    "A value above 1 is read as a 0-100 percentage and divided by 100."
 )
 FIRST_72H_METHOD = (
     "Days are America/Los_Angeles midnight to midnight, including 23- or 25-hour "
@@ -207,6 +209,28 @@ def aggregate_window(window, rows_by_date, available_through):
     }
 
 
+def canonical_reach_date(value):
+    # Bulk files use YYYYMMDD. The reporting overview also mentions YYYY-MM-DD
+    # for a day column, so both are accepted and stored as ISO dates.
+    text = (value or "").strip()
+    if re.fullmatch(r"\d{8}", text):
+        text = f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError("Reach report has an invalid date")
+    datetime.fromisoformat(text)
+    return text
+
+
+def normalize_ctr(value):
+    """CTR is clicks/impressions. 0.0443 means 4.43%. Values above 1 are percents."""
+    if value in (None, ""):
+        return None
+    number = float(value)
+    if number > 1:
+        number /= 100
+    return number
+
+
 def parse_reach_csv(text):
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
@@ -227,10 +251,9 @@ def parse_reach_csv(text):
         video_id = (raw.get(fields["video_id"]) or "").strip()
         if not video_id:
             continue
-        ctr_raw = raw.get(fields["video_thumbnail_impressions_ctr"])
         rows.append(
             {
-                "date": (raw.get(fields["date"]) or "").strip(),
+                "date": canonical_reach_date(raw.get(fields["date"])),
                 "channel_id": (
                     (raw.get(channel_field) or "").strip() if channel_field else ""
                 ),
@@ -238,7 +261,9 @@ def parse_reach_csv(text):
                 "impressions": float(
                     raw.get(fields["video_thumbnail_impressions"]) or 0
                 ),
-                "ctr": float(ctr_raw) if ctr_raw not in (None, "") else None,
+                "ctr": normalize_ctr(
+                    raw.get(fields["video_thumbnail_impressions_ctr"])
+                ),
             }
         )
     return rows
@@ -515,45 +540,46 @@ def retention_curve(http, channel_id, video_id, start, end):
 
 
 def activity_for_channel(http, channel_id, videos, available_through, today):
+    # Basic user activity is dimensions omitted and filters=video== one id.
+    # The day report is dimensions=day with that same single-video filter.
+    # dimensions=video is the top-videos report (sort required, no video filter).
+    # dimensions=day,video is not a listed channel report. One call per video.
     lifetime = {}
     daily = {}
-    # A quiet 28-day probe can miss older videos. Ask through today and let
-    # Analytics stop at the last day it has; available_through still gates 72h.
     end = available_through or today.isoformat()
-    if videos:
-        start = min(pacific_date(publication_time(video)) for video in videos)
-        if start.isoformat() <= end:
-            for batch in chunks([video["id"] for video in videos], 50):
-                for row in analytics_rows(
-                    http,
-                    channel_id,
-                    startDate=start.isoformat(),
-                    endDate=end,
-                    metrics="views,averageViewDuration,subscribersGained",
-                    dimensions="video",
-                    filters=video_filter(batch),
-                ):
-                    lifetime[row["video"]] = row
-        grouped = {}
-        for video in videos:
-            window = window_days(publication_time(video))
-            if not window:
-                continue
-            grouped.setdefault((window[0]["date"], window[-1]["date"]), []).append(
-                video["id"]
+    metrics = "views,averageViewDuration,subscribersGained"
+    for video in videos:
+        video_id = video["id"]
+        published = publication_time(video)
+        publish_day = pacific_date(published).isoformat()
+        if publish_day <= end:
+            rows = analytics_rows(
+                http,
+                channel_id,
+                startDate=publish_day,
+                endDate=end,
+                metrics=metrics,
+                filters=video_filter([video_id]),
             )
-        for (start_day, end_day), video_ids in grouped.items():
-            for batch in chunks(video_ids, 50):
-                for row in analytics_rows(
-                    http,
-                    channel_id,
-                    startDate=start_day,
-                    endDate=end_day,
-                    metrics="views,averageViewDuration,subscribersGained",
-                    dimensions="day,video",
-                    filters=video_filter(batch),
-                ):
-                    daily[(row["video"], row["day"])] = row
+            if rows:
+                lifetime[video_id] = rows[0]
+        window = window_days(published)
+        if (
+            not window
+            or available_through is None
+            or window[0]["date"] > available_through
+        ):
+            continue
+        for row in analytics_rows(
+            http,
+            channel_id,
+            startDate=window[0]["date"],
+            endDate=min(window[-1]["date"], available_through),
+            metrics=metrics,
+            dimensions="day",
+            filters=video_filter([video_id]),
+        ):
+            daily[(video_id, row["day"])] = row
     return lifetime, daily
 
 
@@ -651,12 +677,17 @@ def cell(value):
     if value is None:
         return ""
     if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, float):
+        text = "true" if value else "false"
+    elif isinstance(value, float):
         if not math.isfinite(value):
             return ""
-        return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
-    return value
+        text = f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+    else:
+        text = str(value)
+    # Spreadsheets treat a leading =, +, -, or @ as a formula.
+    if text[:1] in "=+-@":
+        return "'" + text
+    return text
 
 
 def json_cell(value):

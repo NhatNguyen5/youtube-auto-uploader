@@ -64,7 +64,11 @@ Checked against the YouTube Analytics and Reporting docs (metrics list, channel 
 | `audience_retention_lifetime`, `audience_retention_first_72h` | YouTube Analytics API `reports.query` | `audienceWatchRatio` and `relativeRetentionPerformance` by `elapsedVideoTimeRatio` (100 points, one video per request) |
 | `impressions_lifetime`, `impressions_first_72h`, `impressions_ctr_lifetime`, `impressions_ctr_first_72h` | YouTube Reporting API job `channel_reach_basic_a1` | `video_thumbnail_impressions` and `video_thumbnail_impressions_ctr` |
 
-Thumbnail impressions and thumbnail click-through rate are not metrics of `reports.query`. Card and annotation impressions are a different thing and are not used. CTR in the CSV is the API value, clicks divided by impressions, weighted by impressions across days. It is not rescaled to a 0–100 percentage.
+Thumbnail impressions and thumbnail click-through rate are not metrics of `reports.query`. Card and annotation impressions are a different thing and are not used. The Reporting API defines `video_thumbnail_impressions_ctr` as clicks divided by impressions, so `0.0443` means 4.43% rather than a 0–100 number. Downloaded reach files that contain a value above 1 are treated as a 0–100 percentage and divided by 100 before the days are weighted. Bulk report dates are accepted as `YYYYMMDD` (what downloaded files use) or `YYYY-MM-DD`.
+
+Lifetime activity is the basic user-activity report: no `dimensions`, `filters=video==` one video id. The 72-hour rows are `dimensions=day` with that same single-video filter. `dimensions=video` is only the top-videos report, which requires `sort` and does not take a video filter. `dimensions=day,video` is not a listed channel report. Each uploaded video therefore costs its own Analytics calls (lifetime, the short daily window, and two retention curves), run one after another. A daily call is skipped when that video's 72-hour window is still entirely after `analytics_last_day`.
+
+A cell whose text starts with `=`, `+`, `-`, or `@` is prefixed with an apostrophe so a spreadsheet does not treat a title as a formula.
 
 `analytics_last_day` is the newest Pacific day returned for a channel-level `views,averageViewDuration,subscribersGained` query over the 28 days ending today. Analytics leaves out the most recent days. A day with no channel activity can also be absent, which keeps `first_72h_analytics_complete` false without changing totals that would only have added zero. If that 28-day probe has no rows, the column is blank and the 72-hour scalar cells are left empty; lifetime activity is still requested through today.
 
@@ -83,6 +87,16 @@ The window is `[published_at, published_at + 72 hours)`. For a public video, `pu
 - Audience retention is requested for the overlapping Pacific dates. It is a curve, not a count, so the trailing day is not scaled. `audience_retention_first_72h_end` is the last date actually queried.
 
 `first_72h_days` records each overlapping date, the fraction used for the scalar metrics, and whether that Analytics day was included. The same fraction rules are in `first_72h_method` inside the CSV.
+
+### Dry run
+
+This repo has no YouTube credentials. After `login`, point `stats_drive_folder_id` at a folder you can open and run:
+
+```powershell
+uv run youtube-auto-uploader export-stats
+```
+
+Open that week's CSV and `data/stats-reach.json`. Reach days should be `YYYY-MM-DD`, with one CSV row per video. Run the same command again and confirm Drive still has one file for the week. The automated check that does not need a login is `uv run pytest -q tests/test_stats.py`.
 
 ## Drive layout
 
