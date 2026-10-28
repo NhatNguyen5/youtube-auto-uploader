@@ -253,6 +253,44 @@ def test_expired_session_requires_review(tmp_path):
     assert http.put.call_count == 1
 
 
+def test_alternating_blips_keep_first_backoff(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    job = record["jobs"]["long"]
+    job.update(stage="uploading", session=SESSION)
+    clock = {"now": NOW}
+    runner.clock = lambda: clock["now"]
+    mode = {"fail": True}
+
+    def transfer(job, path, save):
+        if mode["fail"]:
+            raise requests.ConnectionError("blip")
+        job["offset"] = job.get("offset", 0) + 1
+        save()
+
+    youtube.transfer.side_effect = transfer
+    for _ in range(12):
+        mode["fail"] = True
+        runner.process("story", "long", record)
+        assert job["stage"] != "needs_review"
+        assert job["consecutive_failures"] == 1
+        retry_at = datetime.fromisoformat(job["next_retry"])
+        delay = (retry_at - clock["now"]).total_seconds()
+        assert 60 <= delay <= 70
+        clock["now"] = retry_at
+        mode["fail"] = False
+        runner.process("story", "long", record)
+        assert job["stage"] != "needs_review"
+        assert job["consecutive_failures"] == 0
+        assert "next_retry" not in job
+    saved = store.load()["stories"]["story"]["jobs"]["long"]
+    assert saved["stage"] == "uploading"
+    assert saved["attempts"] == 12
+    assert saved["consecutive_failures"] == 0
+    assert "next_retry" not in saved
+
+
 def test_network_failure_preserves_session_and_backs_off(setup):
     runner, store, drive, youtube = setup
     runner.discover()
