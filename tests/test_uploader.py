@@ -832,3 +832,79 @@ def test_poll_retry_classifies_quota_and_rate_limits():
     assert action == "quota"
     assert failures == 4
     assert wait >= 1
+
+
+def test_importing_runner_does_not_load_tz_database(monkeypatch):
+    import importlib
+    import zoneinfo
+
+    import youtube_auto_uploader.runner as runner
+
+    calls = []
+    original = zoneinfo.ZoneInfo
+
+    def explode(key):
+        calls.append(key)
+        raise zoneinfo.ZoneInfoNotFoundError(key)
+
+    monkeypatch.setattr(zoneinfo, "ZoneInfo", explode)
+    try:
+        importlib.reload(runner)
+        assert calls == []
+    finally:
+        monkeypatch.setattr(zoneinfo, "ZoneInfo", original)
+        importlib.reload(runner)
+
+
+def test_quota_reset_fallback_around_pacific_dst(monkeypatch):
+    import zoneinfo
+
+    import youtube_auto_uploader.runner as runner
+
+    def explode(key):
+        raise zoneinfo.ZoneInfoNotFoundError(key)
+
+    monkeypatch.setattr(runner, "ZoneInfo", explode)
+    cases = {
+        datetime(2026, 1, 15, 12, tzinfo=UTC): datetime(2026, 1, 16, 8, tzinfo=UTC),
+        datetime(2026, 7, 15, 12, tzinfo=UTC): datetime(2026, 7, 16, 7, tzinfo=UTC),
+        datetime(2026, 3, 8, 9, 30, tzinfo=UTC): datetime(2026, 3, 9, 7, tzinfo=UTC),
+        datetime(2026, 3, 8, 10, 30, tzinfo=UTC): datetime(2026, 3, 9, 7, tzinfo=UTC),
+        datetime(2026, 11, 1, 7, 30, tzinfo=UTC): datetime(2026, 11, 2, 8, tzinfo=UTC),
+        datetime(2026, 11, 1, 10, 30, tzinfo=UTC): datetime(2026, 11, 2, 8, tzinfo=UTC),
+    }
+    for moment, expected in cases.items():
+        assert runner.next_quota_reset(moment) == expected
+
+
+def test_pacific_fallback_matches_zoneinfo():
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    from youtube_auto_uploader.runner import _next_pacific_midnight
+
+    try:
+        zone = ZoneInfo("America/Los_Angeles")
+    except ZoneInfoNotFoundError:
+        pytest.skip("IANA time zone database unavailable")
+    moments = [
+        datetime(2026, 1, 15, 12, tzinfo=UTC),
+        datetime(2026, 1, 16, 8, tzinfo=UTC),
+        datetime(2026, 7, 15, 12, tzinfo=UTC),
+        datetime(2026, 3, 8, 9, 30, tzinfo=UTC),
+        datetime(2026, 3, 8, 10, tzinfo=UTC),
+        datetime(2026, 3, 8, 10, 30, tzinfo=UTC),
+        datetime(2026, 11, 1, 7, 30, tzinfo=UTC),
+        datetime(2026, 11, 1, 8, 30, tzinfo=UTC),
+        datetime(2026, 11, 1, 9, tzinfo=UTC),
+        datetime(2026, 11, 1, 9, 30, tzinfo=UTC),
+        datetime(2024, 3, 10, 9, 59, tzinfo=UTC),
+        datetime(2024, 11, 3, 8, 59, tzinfo=UTC),
+        datetime(2020, 3, 8, 9, 30, tzinfo=UTC),
+        datetime(2030, 11, 3, 8, 30, tzinfo=UTC),
+    ]
+    for moment in moments:
+        local = moment.astimezone(zone)
+        reset = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        if reset <= local:
+            reset += timedelta(days=1)
+        assert _next_pacific_midnight(moment) == reset.astimezone(UTC)
