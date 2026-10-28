@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "videos": {
+    "long": {
+      "filename": "long.mp4",
+      "publish_at": "2026-11-01T18:00:00-06:00",
+      "title": "Example story - full video",
+      "description": "Replace this with the video description.",
+      "tags": [
+        "example"
+      ],
+      "category_id": "22",
+      "default_language": "en",
+      "default_audio_language": "en",
+      "made_for_kids": false,
+      "contains_synthetic_media": false,
+      "license": "youtube",
+      "embeddable": true,
+      "notify_subscribers": true
+    },
+    "short": {
+      "filename": "short.mp4",
+      "publish_at": "2026-11-01T19:00:00-06:00",
+      "title": "Example story - short",
+      "description": "Replace this with the video description.",
+      "tags": [
+        "example"
+      ],
+      "category_id": "22",
+      "default_language": "en",
+      "default_audio_language": "en",
+      "made_for_kids": false,
+      "contains_synthetic_media": false,
+      "license": "youtube",
+      "embeddable": true,
+      "notify_subscribers": true
+    }
+  }
+}
