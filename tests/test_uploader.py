@@ -87,7 +87,16 @@ def test_duplicate_json_keys():
 
 
 @pytest.mark.parametrize(
-    "change", ["naive", "same_file", "unknown", "missing_short", "string_bool"]
+    "change",
+    [
+        "naive",
+        "same_file",
+        "unknown",
+        "missing_short",
+        "string_bool",
+        "missing_audience",
+        "string_synthetic",
+    ],
 )
 def test_invalid_story(change):
     data = story_data()
@@ -99,10 +108,66 @@ def test_invalid_story(change):
         data["command"] = "anything"
     elif change == "missing_short":
         del data["videos"]["short"]
+    elif change == "missing_audience":
+        del data["videos"]["long"]["made_for_kids"]
+    elif change == "string_synthetic":
+        data["videos"]["short"]["contains_synthetic_media"] = "false"
     else:
         data["enabled"] = "true"
     with pytest.raises(ValueError):
         Story.model_validate(data)
+
+
+def test_story_template_audience_flags_default_false():
+    story = Story.model_validate(
+        json.loads(Path("examples/story-config.example.json").read_text())
+    )
+    for video in story.videos.values():
+        assert video.made_for_kids is False
+        assert video.contains_synthetic_media is False
+
+
+def test_upload_and_schedule_send_audience_and_synthetic_flags():
+    data = story_data()
+    data["videos"]["long"]["made_for_kids"] = False
+    data["videos"]["long"]["contains_synthetic_media"] = True
+    data["videos"]["short"]["made_for_kids"] = True
+    data["videos"]["short"]["contains_synthetic_media"] = False
+    story = Story.model_validate(data)
+    http = Mock()
+    http.post.return_value = response(200, headers={"Location": SESSION})
+    http.put.return_value = response(200)
+    youtube = YouTube(http)
+
+    youtube.start(story.videos["long"], source("long"))
+    insert = http.post.call_args
+    assert insert.args[0] == "https://www.googleapis.com/upload/youtube/v3/videos"
+    assert insert.kwargs["params"]["part"] == "snippet,status"
+    assert insert.kwargs["json"]["status"] == {
+        "privacyStatus": "private",
+        "selfDeclaredMadeForKids": False,
+        "containsSyntheticMedia": True,
+        "license": "youtube",
+        "embeddable": True,
+    }
+    assert "madeForKids" not in insert.kwargs["json"]["status"]
+
+    youtube.schedule("video-long", story.videos["long"])
+    update = http.put.call_args
+    assert update.args[0] == "https://www.googleapis.com/youtube/v3/videos"
+    assert update.kwargs["params"] == {"part": "status"}
+    assert update.kwargs["json"]["id"] == "video-long"
+    status = update.kwargs["json"]["status"]
+    assert status["privacyStatus"] == "private"
+    assert status["selfDeclaredMadeForKids"] is False
+    assert status["containsSyntheticMedia"] is True
+    assert status["publishAt"] == story.videos["long"].publish_at.isoformat()
+    assert "madeForKids" not in status
+
+    youtube.start(story.videos["short"], source("short"))
+    short_status = http.post.call_args.kwargs["json"]["status"]
+    assert short_status["selfDeclaredMadeForKids"] is True
+    assert short_status["containsSyntheticMedia"] is False
 
 
 def test_missing_corrupt_and_existing_state(tmp_path):
