@@ -1,7 +1,7 @@
 import hashlib
 import random
-from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from pydantic import ValidationError
@@ -10,7 +10,6 @@ from .drive import ApiError
 from .models import Story
 from .youtube import NeedsReview
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 TRANSIENT_REASONS = {
     "rateLimitExceeded",
@@ -24,9 +23,55 @@ def now():
     return datetime.now(UTC)
 
 
+def _nth_sunday(year, month, n):
+    first = datetime(year, month, 1)
+    return 1 + (6 - first.weekday()) % 7 + (n - 1) * 7
+
+
+def _pacific_offset(moment):
+    """US Pacific offset at this instant. PDT is UTC-7; PST is UTC-8."""
+    utc = moment.astimezone(UTC)
+    # 02:00 PST == 10:00 UTC; 02:00 PDT == 09:00 UTC.
+    start = datetime(utc.year, 3, _nth_sunday(utc.year, 3, 2), 10, tzinfo=UTC)
+    end = datetime(utc.year, 11, _nth_sunday(utc.year, 11, 1), 9, tzinfo=UTC)
+    if start <= utc < end:
+        return timedelta(hours=-7)
+    return timedelta(hours=-8)
+
+
+def _pacific_midnight_utc(year, month, day):
+    """UTC instant of midnight at the start of this Pacific calendar date."""
+    start_day = _nth_sunday(year, 3, 2)
+    end_day = _nth_sunday(year, 11, 1)
+    # Midnight on the spring-forward Sunday is still PST. Midnight on the
+    # fall-back Sunday is still PDT.
+    pdt = (3, start_day) < (month, day) <= (11, end_day)
+    return datetime(year, month, day, 7 if pdt else 8, tzinfo=UTC)
+
+
+def _next_pacific_midnight(moment):
+    """Next US Pacific midnight after moment, without the IANA time zone database.
+
+    PDT (UTC-7) runs from 02:00 local on the second Sunday of March until
+    02:00 local on the first Sunday of November. Every other time is PST (UTC-8).
+    """
+    utc = moment.astimezone(UTC)
+    local = utc.astimezone(timezone(_pacific_offset(utc)))
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if midnight <= local:
+        midnight += timedelta(days=1)
+    return _pacific_midnight_utc(midnight.year, midnight.month, midnight.day)
+
+
 def next_quota_reset(moment):
     # YouTube quota resets at midnight Pacific time.
-    local = moment.astimezone(PACIFIC)
+    # Resolved here, not at import: Windows has no IANA database unless tzdata
+    # is installed, and this project does not depend on it.
+    try:
+        zone = ZoneInfo("America/Los_Angeles")
+    except ZoneInfoNotFoundError:
+        return _next_pacific_midnight(moment)
+    local = moment.astimezone(zone)
     reset = local.replace(hour=0, minute=0, second=0, microsecond=0)
     if reset <= local:
         reset += timedelta(days=1)
