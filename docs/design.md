@@ -16,7 +16,7 @@ The user specifies when a video should become public through publish_at. Downloa
 4. Validate the config and resolve its long and short filenames to unique Drive file IDs in that story folder. Select enabled, due videos in publication-time order. Before either video starts, persist a story snapshot containing both videos' metadata, deadlines, config version/hash, and source identities. Verify download permission, video type, size, and available local disk space.
 5. Download to a temporary cache file, verify size and available checksum, and atomically promote it to a ready file. Record source version and content fingerprint; reject a source that changes during download. Restart interrupted downloads in v1.
 6. Create a YouTube resumable upload with explicit private visibility. Persist the session URL before sending video bytes; upload in chunks and record acknowledged progress.
-7. Persist the returned YouTube video ID immediately. Subsequent work must use this ID, never create another upload for that job.
+7. Persist the returned YouTube video ID immediately. Subsequent work must use this ID, never create another upload for that job. After that save, append one upload-log line when that job id is not already present.
 8. Poll processing status without blocking all scheduling work. After success, recheck the deadline and submit private visibility plus publishAt. Read back the remote settings before marking scheduled.
 9. After the publication time, reconcile actual visibility. Mark published only after observing public visibility; report processing failures or delayed publication separately.
 
@@ -48,7 +48,7 @@ Story identity is the permanent Drive story-folder ID; video identity is (story-
 
 Track the two videos independently. A story is uploaded only when both have persisted YouTube IDs, scheduled only when both schedules are confirmed, and published only when both are observed public. If long succeeds and short fails, resume only short; never re-upload long. Uploaded stories still require processing/scheduling reconciliation. A known video ID or ambiguous session always takes precedence over discovery of a supposedly new job.
 
-Before the first video starts, config edits can update pending jobs. Once either starts, freeze the complete story snapshot, including the second video, and report later config/source changes for review. A changed source must not silently replace bytes used by an active resumable session. Disabling, removing, or renaming files after work starts does not cancel remote work or a schedule. Keep completed identities permanently; do not move, rename, delete, or write marker files into Drive. Local state is the record of what this installation uploaded; pre-existing manual uploads require reconciliation before enabling a story.
+Before the first video starts, config edits can update pending jobs. Once either starts, freeze the complete story snapshot, including the second video, and report later config/source changes for review. A changed source must not silently replace bytes used by an active resumable session. Disabling, removing, or renaming files after work starts does not cancel remote work or a schedule. Keep completed identities permanently; do not move, rename, delete, or write marker files into story folders. The only Drive write is the upload log in its own folder, described below. Local state is the record of what this installation uploaded; pre-existing manual uploads require reconciliation before enabling a story.
 
 ## Scheduling and deadlines
 
@@ -76,11 +76,19 @@ On restart, query the saved resumable session for accepted bytes or completion b
 
 This reduces duplicates but cannot promise exactly-once delivery: YouTube upload completion and local state persistence are not one transaction. A database alone would not remove that boundary. Cache cleanup must preserve files needed by unfinished or ambiguous sessions.
 
+## Upload log
+
+Local state remains the authority for whether a video was uploaded. A saved YouTube video ID blocks another upload of that job. After each finished upload attempt, the runner appends one JSONL record to `uploads.jsonl` in the Drive folder `upload_log_folder_id` from application settings. An empty folder id disables the log. Story folders are not modified.
+
+JSONL is one JSON object per line so another Drive reader can download the file and parse it without the Sheets API. CSV would split error text that contains commas, quotes, or newlines. Each object has `schema_version`, `date` (ISO-8601 UTC, frozen on the first log attempt), `channel` (YouTube channel ID), `source_file`, `source_file_id`, `video_id`, `status`, `error`, and `job_id`. `channel` is what makes the file multi-channel-ready; one channel is live today. `job_id` is `{channel_id}/{story_folder_id}/{long|short}` and is the idempotency key. A rerun, or a crash after Drive accepts the line and before local confirmation, reads the file and does not append again. The first recorded outcome for that job is kept.
+
+The line is written only after the video ID or the terminal failure is already stored locally. If the append fails, the runner reports `upload log failed`, leaves the YouTube video ID in place, and retries the same line on a later pass. `status` shows `upload-log:` until that succeeds. In-progress transfers and missed deadlines with no video ID are not log lines. A saved video ID is recorded as `uploaded`, including when the job is later scheduled, published, or missed. `failed` is used when YouTube rejects a video that already has an ID. `needs_review` is used when a resumable session ended without a video ID. A processing failure discovered after the line was written stays in local state instead of adding a second line.
+
 ## Authentication and operation
 
 Enable Google Drive API and YouTube Data API in a Google Cloud project. Use a desktop OAuth client with an interactive first login and refreshable user credentials. Load GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET from the local .env file using python-dotenv; existing process environment variables take precedence. Require nonempty credentials for login/run and report missing variable names without logging values. GOOGLE_TOKEN_PATH defaults to secrets/token.json, resolved relative to the local application config directory; load .env from that directory explicitly so scheduled launches do not depend on the working directory. Build the desktop OAuth client configuration from these variables. Store generated access/refresh tokens in the token file, not back into .env. No API key or account password is needed. These loading rules are implemented; login requires user-provided Google credentials. Confirm the selected YouTube channel matches the configured channel ID before uploading. A normal YouTube channel uses user OAuth, not a service account.
 
-Plan Drive read-only scope for fetching existing folder files, plus the minimum YouTube scopes covering upload, owner status reads, and scheduling updates. Verify method-specific scope support during implementation; upload permission alone must not be assumed sufficient for all operations. Restrict token/session files to the local user and redact them from logs. Keep credentials, actual jobs/settings, downloaded videos, and state outside Git.
+Use Drive read-only scope for fetching existing folder files, plus `drive.file` so this app can create and append `uploads.jsonl`, plus the minimum YouTube scopes covering upload, owner status reads, and scheduling updates. `drive.file` does not grant access to story folders. A saved token that predates the log scope is refreshed with its original grant so uploads are not blocked; log writes fail until `login` is run again, then the same line is retried. Verify method-specific scope support during implementation; upload permission alone must not be assumed sufficient for all operations. Restrict token/session files to the local user and redact them from logs. Keep credentials, actual jobs/settings, downloaded videos, and state outside Git.
 
 Preflight should check account permissions, current API requirements, quota availability where exposed, and channel upload eligibility. Expired consent or revoked credentials pauses affected work and requests login. Confirm scheduled publication with a controlled integration test before relying on unattended operation.
 
@@ -90,9 +98,9 @@ Preflight should check account permissions, current API requirements, quota avai
 pyproject.toml / uv.lock
 src/youtube_auto_uploader/
   models.py       # Validation, jobs, settings, state
-  storage.py      # JSON persistence and process lock
+  storage.py      # JSON persistence, process lock, upload-log identity
   google_auth.py  # OAuth and token refresh
-  drive.py        # Story discovery, config fetching, source validation/downloads
+  drive.py        # Story discovery, downloads, upload-log append
   youtube.py      # Resumable upload and remote status
   runner.py       # Scheduling decisions and workflow
   cli.py          # Commands and exit codes

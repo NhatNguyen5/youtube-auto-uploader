@@ -75,9 +75,10 @@ def main():
                             if job.get("video_id")
                             else ""
                         )
-                        print(
-                            f"{sid}/{role}: {job['stage']} {url} {job.get('error', '')}"
-                        )
+                        detail = job.get("error", "")
+                        if job.get("log_error"):
+                            detail = f"{detail} upload-log: {job['log_error']}".strip()
+                        print(f"{sid}/{role}: {job['stage']} {url} {detail}")
                 if not state["stories"]:
                     print("No stories started yet.")
                 return 0

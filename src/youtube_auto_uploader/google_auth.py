@@ -8,10 +8,26 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 from .storage import atomic_json
 
+# drive.file is only for the upload log this app creates. Story folders stay read-only.
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/youtube.force-ssl",
 ]
+
+
+def scopes_for_refresh(granted):
+    """Scopes to send when refreshing a saved token.
+
+    A token from before the upload log does not include drive.file. Asking
+    Google to refresh a scope it never granted returns invalid_scope and would
+    stop uploads. Keep that saved grant until login is run again; log writes
+    then fail on their own and are retried after re-consent.
+    """
+    granted = list(granted or [])
+    if set(SCOPES).issubset(granted):
+        return list(SCOPES)
+    return granted or None
 
 
 def token_path(base):
@@ -47,7 +63,13 @@ def session(base):
     path = token_path(base)
     if not path.exists():
         raise ValueError("OAuth token missing; run login first")
-    credentials = Credentials.from_authorized_user_file(str(path), SCOPES)
+    info = json.loads(path.read_text(encoding="utf-8"))
+    granted = info.get("scopes")
+    if isinstance(granted, str):
+        granted = granted.split(" ")
+    credentials = Credentials.from_authorized_user_info(
+        info, scopes_for_refresh(granted)
+    )
     return AuthorizedSession(credentials), lambda: atomic_json(
         path, json.loads(credentials.to_json())
     )

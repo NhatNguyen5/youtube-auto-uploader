@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "drive_folder_id": "1RUg3Mlt9JKHBGEdjE-VMJfB2nmNnq8SE",
+  "upload_log_folder_id": "REPLACE_WITH_UPLOAD_LOG_FOLDER_ID",
   "youtube_channel_id": "REPLACE_WITH_YOUTUBE_CHANNEL_ID",
   "upload_lead_minutes": 180,
   "poll_seconds": 30,
