@@ -80,7 +80,7 @@ This reduces duplicates but cannot promise exactly-once delivery: YouTube upload
 
 Enable Google Drive API and YouTube Data API in a Google Cloud project. Use a desktop OAuth client with an interactive first login and refreshable user credentials. Load GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET from the local .env file using python-dotenv; existing process environment variables take precedence. Require nonempty credentials for login/run and report missing variable names without logging values. GOOGLE_TOKEN_PATH defaults to secrets/token.json, resolved relative to the local application config directory; load .env from that directory explicitly so scheduled launches do not depend on the working directory. Build the desktop OAuth client configuration from these variables. Store generated access/refresh tokens in the token file, not back into .env. No API key or account password is needed. These loading rules are implemented; login requires user-provided Google credentials. Confirm the selected YouTube channel matches the configured channel ID before uploading. A normal YouTube channel uses user OAuth, not a service account.
 
-Plan Drive read-only scope for fetching existing folder files, plus the minimum YouTube scopes covering upload, owner status reads, and scheduling updates. Verify method-specific scope support during implementation; upload permission alone must not be assumed sufficient for all operations. Restrict token/session files to the local user and redact them from logs. Keep credentials, actual jobs/settings, downloaded videos, and state outside Git.
+Plan Drive read-only scope for fetching existing folder files, plus the minimum YouTube scopes covering upload, owner status reads, and scheduling updates. The weekly stats export also requests `drive.file` (create and overwrite the stats CSV only) and `yt-analytics.readonly` (Analytics `reports.query`). It does not request the full `drive` scope, so the token still cannot edit story videos. Verify method-specific scope support during implementation; upload permission alone must not be assumed sufficient for all operations. Restrict token/session files to the local user and redact them from logs. Keep credentials, actual jobs/settings, downloaded videos, and state outside Git. Re-run login after the scope list changes. `export-stats` checks the saved token and refuses to run while any requested scope is missing; upload commands keep refreshing whatever scopes the token already has.
 
 Preflight should check account permissions, current API requirements, quota availability where exposed, and channel upload eligibility. Expired consent or revoked credentials pauses affected work and requests login. Confirm scheduled publication with a controlled integration test before relying on unattended operation.
 
@@ -95,6 +95,7 @@ src/youtube_auto_uploader/
   drive.py        # Story discovery, config fetching, source validation/downloads
   youtube.py      # Resumable upload and remote status
   runner.py       # Scheduling decisions and workflow
+  stats.py        # Weekly per-video stats export
   cli.py          # Commands and exit codes
 tests/
 ```
@@ -111,6 +112,7 @@ uv run youtube-auto-uploader init-state
 uv run youtube-auto-uploader run
 uv run youtube-auto-uploader run --once
 uv run youtube-auto-uploader status
+uv run youtube-auto-uploader export-stats
 ```
 
 run --once performs one reconciliation/due-work pass and exits; it may spend time transferring a video. Validation has no upload side effects. Logs include job ID, stage, attempt, and useful error details. status shows deadlines, progress, and known YouTube links.
@@ -124,9 +126,25 @@ run --once performs one reconciliation/due-work pass and exits; it may spend tim
 
 Essential tests: paginated story discovery, missing/duplicate config or source files, renamed folders, partial story completion, remote config edits after the first upload, repeated scans without duplicate uploads, malformed/corrupt JSON, duplicate IDs/keys, absent state, simultaneous starts, edits to active jobs, timezone boundaries, missed deadlines, changed source files, interrupted transfers, crashes before/after session persistence, lost completion responses, expired sessions, failed state writes, and scheduling requests accepted despite a lost response. Use fake clocks and mocked APIs for failure cases. Live validation requires user credentials and a designated test video.
 
+## Weekly performance export
+
+`export-stats` writes a CSV of the channel's current uploads playlist into a configurable Drive folder. One file per channel per ISO week (America/Los_Angeles), named `youtube-stats-<channel id>-<year>-W<week>.csv`. The command finds that name in the folder and overwrites the file this exporter created. It does not create a second file for the same week, and each file has one row per video id. A pre-existing file with that name that this exporter did not create is left untouched and the command fails instead of adding a duplicate.
+
+The same OAuth login is used. `drive.readonly` still reads the story inbox and lists the stats folder. `drive.file` is what creates and updates the CSV. `yt-analytics.readonly` reads Analytics `reports.query`.
+
+Scalar activity (views, average view duration, subscribers gained) and the audience-retention curve come from YouTube Analytics API `reports.query`. Lifetime activity omits `dimensions` and sets `filters=video==` to one video id. Daily activity uses `dimensions=day` with that same filter. `dimensions=video` and `dimensions=day,video` are not used. Thumbnail impressions are not in this export. The CSV column list is ordered so a later metric group can append columns.
+
+There is no hourly dimension. The first 72 hours are the Pacific days that overlap `[published_at, published_at + 72 hours)`, with the publish day counted in full and the trailing day scaled by how much of that local day is inside the window. Retention is the curve for those whole dates and is not scaled. Days the API has not published yet are omitted, not stored as zero, and the completeness column stays false until a later overwrite of the same weekly file. README.md records the column-to-metric map and the cron / Task Scheduler line. Nothing is registered automatically.
+
+A non-empty `stats_channels` list exports each channel to its own folder. Each channel is a separate `channel==` query, and the command stops if the login cannot see that channel. Leave the list empty to export `youtube_channel_id` into `stats_drive_folder_id`.
+
 ## API references
 
 - [uv projects](https://docs.astral.sh/uv/guides/projects/) describes project and lockfile management.
 - [Drive downloads](https://developers.google.com/workspace/drive/api/guides/manage-downloads) documents blob downloads with files.get and alt=media.
 - [YouTube resumable uploads](https://developers.google.com/youtube/data/guides/using_resumable_upload_protocol) documents session initiation and recovery queries.
 - [YouTube video resource](https://developers.google.com/youtube/data/reference/rest/v3/videos) defines processing status, metadata, and publishAt: schedule a private, never-published video, include private when updating, and avoid past timestamps.
+- [YouTube Analytics metrics](https://developers.google.com/youtube/analytics/metrics) defines `views`, `averageViewDuration`, `subscribersGained`, `audienceWatchRatio`, and `relativeRetentionPerformance`.
+- [YouTube Analytics channel reports](https://developers.google.com/youtube/analytics/channel_reports) defines the per-video activity query and the audience-retention query (`elapsedVideoTimeRatio`, one video id).
+- [YouTube Analytics dimensions](https://developers.google.com/youtube/analytics/dimensions) defines a `day` as Pacific midnight to midnight, including 23- and 25-hour daylight-saving days, and notes that recent days are omitted until the requested metrics are available.
+- [Drive API scopes](https://developers.google.com/workspace/drive/api/guides/api-specific-auth) distinguishes `drive.file` from the full `drive` scope. `files.create` accepts `drive.file` and a parent folder.
