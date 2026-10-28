@@ -5,5 +5,7 @@
   "upload_lead_minutes": 180,
   "poll_seconds": 30,
   "state_path": "data/state.json",
-  "cache_dir": "data/cache"
+  "cache_dir": "data/cache",
+  "stats_drive_folder_id": "REPLACE_WITH_STATS_DRIVE_FOLDER_ID",
+  "stats_state_path": "data/stats-reach.json"
 }

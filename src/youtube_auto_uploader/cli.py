@@ -9,8 +9,41 @@ from . import google_auth
 from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
+from .stats import export_stats, stats_targets
 from .storage import Store, parse_json
 from .youtube import YouTube
+
+
+def export_command(settings, base, week):
+    http = None
+    persist = None
+    try:
+        if not stats_targets(settings):
+            raise ValueError(
+                "Set stats_drive_folder_id or stats_channels before export-stats"
+            )
+        missing = google_auth.missing_scopes(base)
+        if missing:
+            raise ValueError(
+                "Saved OAuth token is missing scopes. Run login again to grant: "
+                + ", ".join(missing)
+            )
+        http, persist = google_auth.session(base)
+        exported = export_stats(settings, base, http, week=week)
+    except (ValueError, ApiError) as error:
+        print(f"Error: {error}")
+        return 1
+    finally:
+        if persist:
+            persist()
+        if http:
+            http.close()
+    for item in exported:
+        print(
+            f"Exported {item['videos']} videos for {item['channel_id']} "
+            f"week {item['week']} to Drive file {', '.join(item['file_ids'])}."
+        )
+    return 0
 
 
 def main():
@@ -32,6 +65,11 @@ def main():
     )
     run = commands.add_parser("run")
     run.add_argument("--once", action="store_true")
+    export = commands.add_parser("export-stats")
+    export.add_argument(
+        "--week",
+        help="ISO week file to overwrite, such as 2026-W44. Defaults to the current Pacific week.",
+    )
     args = parser.parse_args()
     base = args.config.resolve().parent
     try:
@@ -42,6 +80,8 @@ def main():
         settings = Settings.model_validate(
             parse_json(args.config.read_text(encoding="utf-8-sig"))
         )
+        if args.command == "export-stats":
+            return export_command(settings, base, args.week)
         store = Store(base / settings.state_path)
         if args.command == "validate":
             if args.story:

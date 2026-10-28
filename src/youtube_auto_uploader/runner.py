@@ -87,6 +87,34 @@ class Runner:
     def save(self):
         self.store.save(self.state)
 
+    def note_progress(self, job):
+        job["consecutive_failures"] = 0
+        job.pop("next_retry", None)
+
+    def transfer_with_progress(self, job, path):
+        acknowledged = job.get("offset") or 0
+
+        def checkpoint():
+            nonlocal acknowledged
+            offset = job.get("offset")
+            if job.get("video_id") or (
+                isinstance(offset, int) and offset > acknowledged
+            ):
+                self.note_progress(job)
+            if isinstance(offset, int):
+                acknowledged = offset
+            self.save()
+
+        self.youtube.transfer(job, path, checkpoint)
+
+    def seconds_before_schedule_margin(self, record, role):
+        publish_at = Story.model_validate(record["snapshot"]).videos[role].publish_at
+        return (
+            publish_at
+            - timedelta(seconds=self.settings.schedule_margin_seconds)
+            - self.clock()
+        ).total_seconds()
+
     def discover(self):
         folders = self.drive.children(self.settings.drive_folder_id)
         for folder in folders:
@@ -119,7 +147,12 @@ class Runner:
                     "name": folder["name"],
                     "snapshot": story.model_dump(mode="json"),
                     "jobs": {
-                        role: {"stage": "pending", "source": source, "attempts": 0}
+                        role: {
+                            "stage": "pending",
+                            "source": source,
+                            "attempts": 0,
+                            "consecutive_failures": 0,
+                        }
                         for role, source in sources.items()
                     },
                 }
@@ -129,6 +162,17 @@ class Runner:
                 self.report(
                     f"Story {sid}: waiting for valid config and two unique videos ({type(error).__name__})"
                 )
+            except ApiError as error:
+                self.report(f"Story {sid}: HTTP {error.status}: {error.reason}")
+            except requests.RequestException as error:
+                # Do not print the exception text; it may contain a request URL.
+                response = getattr(error, "response", None)
+                status = getattr(response, "status_code", None)
+                reason = getattr(response, "reason", None) or type(error).__name__
+                if status is None:
+                    self.report(f"Story {sid}: {reason}")
+                else:
+                    self.report(f"Story {sid}: HTTP {status}: {reason}")
 
     def step(self, sid, role, record):
         video = Story.model_validate(record["snapshot"]).videos[role]
@@ -145,6 +189,17 @@ class Runner:
             remote = self.youtube.inspect(job["video_id"])
             status = remote["status"]
             processing = remote.get("processingDetails", {}).get("processingStatus")
+            observed = {
+                "privacy": status.get("privacyStatus"),
+                "upload": status.get("uploadStatus"),
+                "processing": processing,
+                "publish_at": status.get("publishAt"),
+            }
+            # A read is not progress. Reset only when the remote phase changes.
+            previous = job.get("remote_stage")
+            if previous is not None and previous != observed:
+                self.note_progress(job)
+            job["remote_stage"] = observed
             job["processing_status"] = processing
             if status.get("privacyStatus") == "public":
                 job["stage"] = "published"
@@ -176,6 +231,8 @@ class Runner:
                 job["stage"] = "scheduling"
                 self.save()
                 self.youtube.schedule(job["video_id"], video)
+                self.note_progress(job)
+                self.save()
                 return
             self.save()
             return
@@ -201,11 +258,12 @@ class Runner:
         else:
             if job.get("session"):
                 # The remote session can still recover a completed video's ID.
-                self.youtube.transfer(job, path, self.save)
+                self.transfer_with_progress(job, path)
                 return
             job["stage"] = "downloading"
             self.save()
             job["cache_md5"] = self.drive.download(source, path)
+            self.note_progress(job)
             self.save()
         if not job.get("session"):
             if self.clock() >= video.publish_at:
@@ -215,8 +273,9 @@ class Runner:
             self.youtube.validate_category(video.category_id)
             job["session"] = self.youtube.start(video, source)
             job["stage"] = "uploading"
+            self.note_progress(job)
             self.save()  # No video bytes may be sent until this succeeds.
-        self.youtube.transfer(job, path, self.save)
+        self.transfer_with_progress(job, path)
 
     def process(self, sid, role, record):
         job = record["jobs"][role]
@@ -227,9 +286,10 @@ class Runner:
             self.save()
         except (ApiError, requests.RequestException) as error:
             kind = error_kind(error)
-            # Quota resets on a clock, so it must not burn the attempt budget.
+            # Quota resets on a clock, so it must not burn the attempt or streak.
             if kind != "quota":
                 job["attempts"] += 1
+                job["consecutive_failures"] = job.get("consecutive_failures", 0) + 1
             job["error"] = (
                 str(error)
                 if isinstance(error, ApiError)
@@ -248,14 +308,22 @@ class Runner:
                     job.pop("next_retry", None)
                 else:
                     moment = self.clock()
-                    remaining = (next_quota_reset(moment) - moment).total_seconds()
-                    delay = scheduled_delay(remaining, getattr(error, "retry_after", 0))
+                    until_reset = (next_quota_reset(moment) - moment).total_seconds()
+                    delay = scheduled_delay(
+                        until_reset, getattr(error, "retry_after", 0)
+                    )
                     job["next_retry"] = (moment + timedelta(seconds=delay)).isoformat()
-            elif kind == "transient" and job["attempts"] < 10:
+            elif kind == "transient" and job.get("consecutive_failures", 0) < 10:
+                retry_after = getattr(error, "retry_after", 0)
+                grown = 30 * 2 ** min(job["consecutive_failures"], 7)
+                delay = max(retry_after, min(3600, grown) + random.uniform(0, 10))
+                remaining = self.seconds_before_schedule_margin(record, role)
+                # Stay at least as long as Retry-After. A sub-second window
+                # would busy-loop, so leave the normal backoff in place.
+                if remaining >= 1:
+                    delay = max(retry_after, min(delay, remaining))
+                delay = scheduled_delay(delay, retry_after)
                 moment = self.clock()
-                grown = 30 * 2 ** min(job["attempts"], 7)
-                computed = min(3600, grown) + random.uniform(0, 10)
-                delay = scheduled_delay(computed, getattr(error, "retry_after", 0))
                 job["next_retry"] = (moment + timedelta(seconds=delay)).isoformat()
             else:
                 job["stage"] = "needs_review"

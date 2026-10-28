@@ -1,11 +1,42 @@
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+DRIVE_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+
+
+def require_drive_id(value, label="Drive folder ID"):
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(character not in DRIVE_ID_ALPHABET for character in value)
+    ):
+        raise ValueError(f"Invalid {label}")
+    return value
+
 
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class StatsChannel(Model):
+    youtube_channel_id: str
+    drive_folder_id: str
+    label: str = ""
+
+    @field_validator("youtube_channel_id", "drive_folder_id")
+    @classmethod
+    def ids(cls, value, info):
+        return require_drive_id(value, info.field_name)
+
+    @field_validator("label")
+    @classmethod
+    def label_text(cls, value):
+        if len(value) > 100 or any(character in value for character in "\r\n\x00"):
+            raise ValueError("invalid label")
+        return value
 
 
 class Settings(Model):
@@ -17,6 +48,24 @@ class Settings(Model):
     schedule_margin_seconds: int = Field(default=60, ge=30)
     state_path: str = "data/state.json"
     cache_dir: str = "data/cache"
+    stats_drive_folder_id: str | None = None
+    stats_state_path: str = "data/stats-reach.json"
+    stats_channels: list[StatsChannel] = Field(default_factory=list)
+
+    @field_validator("stats_drive_folder_id")
+    @classmethod
+    def stats_folder(cls, value):
+        if value is None:
+            return None
+        return require_drive_id(value, "stats Drive folder ID")
+
+    @field_validator("stats_state_path")
+    @classmethod
+    def stats_path(cls, value):
+        path = Path(value)
+        if not value or path.is_absolute() or ".." in path.parts:
+            raise ValueError("stats_state_path must stay under the config directory")
+        return value
 
 
 class Video(Model):

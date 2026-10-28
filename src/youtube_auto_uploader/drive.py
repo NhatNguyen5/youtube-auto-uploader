@@ -1,14 +1,18 @@
 import hashlib
+import json
 import os
 import shutil
+import uuid
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
-from .models import Story
+from .models import Story, require_drive_id
 from .storage import parse_json
 
 ROOT = "https://www.googleapis.com/drive/v3/files"
+UPLOAD = "https://www.googleapis.com/upload/drive/v3/files"
 FIELDS = "id,name,mimeType,size,md5Checksum,version,parents,capabilities(canDownload)"
+STATS_EXPORTER = "youtube-auto-uploader-stats"
 
 
 class ApiError(Exception):
@@ -49,11 +53,7 @@ class Drive:
         self.http = http
 
     def children(self, folder):
-        if not folder or any(
-            c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-            for c in folder
-        ):
-            raise ValueError("Invalid Drive folder ID")
+        require_drive_id(folder, "Drive folder ID")
         params = {
             "q": f"'{folder}' in parents and trashed = false",
             "pageSize": 1000,
@@ -154,6 +154,92 @@ class Drive:
             raise ValueError("Drive source changed during download")
         os.replace(partial, target)
         return digest.hexdigest()
+
+    def files_named(self, folder, name):
+        require_drive_id(folder, "Drive folder ID")
+        quoted_name = name.replace("\\", "\\\\").replace("'", "\\'")
+        quoted_folder = folder.replace("\\", "\\\\").replace("'", "\\'")
+        params = {
+            "q": (
+                f"name = '{quoted_name}' and '{quoted_folder}' in parents "
+                "and trashed = false"
+            ),
+            "pageSize": 1000,
+            "fields": "nextPageToken,files(id,name,appProperties)",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        }
+        found = []
+        while True:
+            data = checked(self.http.get(ROOT, params=params, timeout=60)).json()
+            found.extend(data.get("files", []))
+            if not data.get("nextPageToken"):
+                return found
+            params["pageToken"] = data["nextPageToken"]
+
+    def upsert_stats_file(self, folder, name, content):
+        """Create or overwrite the weekly stats CSV. Never adds a second file."""
+        matches = self.files_named(folder, name)
+        ours = [
+            item
+            for item in matches
+            if (item.get("appProperties") or {}).get("exporter") == STATS_EXPORTER
+        ]
+        our_ids = {item["id"] for item in ours}
+        foreign = [item for item in matches if item["id"] not in our_ids]
+        if foreign and not ours:
+            raise ValueError(
+                f"{name} already exists in the stats folder and was not created by export-stats"
+            )
+        metadata = {
+            "name": name,
+            "mimeType": "text/csv",
+            "appProperties": {"exporter": STATS_EXPORTER},
+        }
+        if ours:
+            return [
+                self._upload_csv(item["id"], metadata, content)
+                for item in sorted(ours, key=lambda item: item["id"])
+            ]
+        metadata["parents"] = [folder]
+        return [self._upload_csv(None, metadata, content)]
+
+    def _upload_csv(self, file_id, metadata, content):
+        boundary = f"stats{uuid.uuid4().hex}"
+        body = b"".join(
+            [
+                f"--{boundary}\r\n".encode(),
+                b"Content-Type: application/json; charset=UTF-8\r\n\r\n",
+                json.dumps(metadata).encode("utf-8"),
+                f"\r\n--{boundary}\r\n".encode(),
+                b"Content-Type: text/csv; charset=UTF-8\r\n\r\n",
+                content,
+                f"\r\n--{boundary}--\r\n".encode(),
+            ]
+        )
+        headers = {"Content-Type": f"multipart/related; boundary={boundary}"}
+        params = {
+            "uploadType": "multipart",
+            "supportsAllDrives": "true",
+            "fields": "id",
+        }
+        if file_id:
+            response = self.http.patch(
+                f"{UPLOAD}/{file_id}",
+                params=params,
+                data=body,
+                headers=headers,
+                timeout=120,
+            )
+        else:
+            response = self.http.post(
+                UPLOAD,
+                params=params,
+                data=body,
+                headers=headers,
+                timeout=120,
+            )
+        return checked(response).json()["id"]
 
 
 def fingerprint(source):
