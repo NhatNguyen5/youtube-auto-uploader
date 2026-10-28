@@ -18,14 +18,10 @@ from youtube_auto_uploader.stats import (
     PACIFIC,
     aggregate_window,
     analytics_rows,
-    apply_reach_report,
     canonical_week,
     cell,
     export_stats,
-    parse_reach_csv,
     publication_time,
-    reach_summary,
-    report_is_newer,
     stats_targets,
     week_key,
     window_days,
@@ -110,33 +106,6 @@ def test_aggregate_window_prorates_trailing_day_and_skips_unready_days():
     assert aggregate_window(window, rows, None)["views"] is None
 
 
-def test_reach_fixture_accepts_bulk_yyyymmdd_and_ratio_ctr():
-    text = Path("tests/fixtures/channel_reach_basic_a1.csv").read_text(encoding="utf-8")
-    rows = parse_reach_csv(text)
-    assert [row["video_id"] for row in rows] == ["video1"]
-    assert rows[0]["date"] == "2026-06-01"
-    assert rows[0]["impressions"] == 293
-    assert rows[0]["ctr"] == pytest.approx(0.0443)
-    state = {"days": {}}
-    apply_reach_report(
-        state,
-        {
-            "id": "reach-1",
-            "startTime": "2026-06-01T07:00:00Z",
-            "createTime": "2026-06-03T00:00:00Z",
-        },
-        text,
-    )
-    assert state["days"]["2026-06-01"]["videos"]["video1"]["impressions"] == 293
-    percent = parse_reach_csv(
-        "date,channel_id,video_id,video_thumbnail_impressions,"
-        "video_thumbnail_impressions_ctr\n"
-        "2026-06-01,UCchannel,video1,293,4.43\n"
-    )
-    assert percent[0]["ctr"] == pytest.approx(0.0443)
-    assert percent[0]["date"] == "2026-06-01"
-
-
 def test_cell_guards_formula_injection():
     assert cell("=HYPERLINK()") == "'=HYPERLINK()"
     assert cell("+1+1") == "'+1+1"
@@ -146,69 +115,10 @@ def test_cell_guards_formula_injection():
     assert cell(200) == "200"
 
 
-def test_reach_ingest_replaces_a_day_instead_of_adding():
-    state = {"schema_version": 1, "reach_job_id": "job", "days": {}}
-    report = {
-        "id": "r1",
-        "startTime": "2026-06-01T07:00:00Z",
-        "createTime": "2026-06-03T00:00:00Z",
-    }
-    text = (
-        "date,channel_id,video_id,video_thumbnail_impressions,"
-        "video_thumbnail_impressions_ctr\n"
-        "2026-06-01,UCchannel,video1,10,0.2\n"
-        "2026-06-01,UCchannel,video1,99,0.2\n"
-    )
-    apply_reach_report(state, report, text)
-    apply_reach_report(state, report, text)
-    assert state["days"]["2026-06-01"]["videos"]["video1"]["impressions"] == 99
-    newer = {**report, "id": "r2", "createTime": "2026-06-04T00:00:00Z"}
-    assert report_is_newer(state["days"]["2026-06-01"], newer)
-    apply_reach_report(state, newer, text.replace(",99,", ",15,"))
-    assert state["days"]["2026-06-01"]["videos"]["video1"]["impressions"] == 15
-    assert state["days"]["2026-06-01"]["report_id"] == "r2"
-    assert not report_is_newer(state["days"]["2026-06-01"], newer)
-    with pytest.raises(ValueError, match="does not match"):
-        apply_reach_report(
-            state,
-            newer,
-            text.replace("2026-06-01", "2026-06-02"),
-        )
-
-
-def test_reach_summary_weights_ctr_and_counts_missing_days():
-    state = {"days": {}}
-
-    def add(day, impressions, ctr):
-        apply_reach_report(
-            state,
-            {
-                "id": "r-" + day,
-                "startTime": f"{day}T07:00:00Z",
-                "createTime": "2026-06-10T00:00:00Z",
-            },
-            "date,channel_id,video_id,video_thumbnail_impressions,"
-            "video_thumbnail_impressions_ctr\n"
-            f"{day},UCchannel,video1,{impressions},{ctr}\n",
-        )
-
-    add("2026-06-01", 100, 0.1)
-    add("2026-06-03", 10, 0)
-    published = datetime(2026, 6, 1, 15, tzinfo=PACIFIC)
-    summary = reach_summary(state["days"], "video1", "UCchannel", published)
-    assert summary["impressions_lifetime"] == pytest.approx(110)
-    assert summary["impressions_ctr_lifetime"] == pytest.approx(10 / 110)
-    assert summary["impressions_missing_days"] == 1
-    assert summary["first_72h_reach_complete"] is False
-    other = reach_summary(state["days"], "video1", "UCother", published)
-    assert other["impressions_lifetime"] is None
-
-
 def test_settings_stats_targets_and_example_config():
     example = Settings.model_validate(
         json.loads(Path("examples/config.example.json").read_text(encoding="utf-8"))
     )
-    assert example.stats_state_path == "data/stats-reach.json"
     assert stats_targets(example)[0].youtube_channel_id == example.youtube_channel_id
     single = Settings(youtube_channel_id="channel", stats_drive_folder_id="folderone")
     assert stats_targets(single)[0].drive_folder_id == "folderone"
@@ -226,8 +136,6 @@ def test_settings_stats_targets_and_example_config():
     assert [target.youtube_channel_id for target in stats_targets(listed)] == ["UCkids"]
     with pytest.raises(ValueError):
         Settings(youtube_channel_id="channel", stats_drive_folder_id="bad id")
-    with pytest.raises(ValueError):
-        Settings(youtube_channel_id="channel", stats_state_path="../secrets/token.json")
     with pytest.raises(ValueError, match="2026-W44"):
         canonical_week("next-week", MOMENT)
 
@@ -358,53 +266,28 @@ def test_drive_upsert_refuses_a_foreign_file_with_the_same_name():
     assert http.files["user-file"]["csv"] == b"keep"
 
 
-REACH_DAYS = (
-    ("2026-06-01", 100, 0.1),
-    ("2026-06-02", 40, 0.5),
-    ("2026-06-03", 10, 0),
-    ("2026-06-04", 8, 0.25),
-)
-
-
 class Api:
-    def __init__(self):
-        self.jobs = []
-        self.created_jobs = 0
-        self.downloads = []
+    def __init__(self, channels=None):
+        self.channels = channels or ["UCchannel"]
         self.retention = []
+        self.analytics_ids = []
         self.files = {}
         self.created = []
         self.updated = []
-        self.reports = []
-        self.csv_by_id = {}
-        for day, impressions, ctr in REACH_DAYS:
-            report_id = "report-" + day
-            self.reports.append(
-                {
-                    "id": report_id,
-                    "startTime": f"{day}T07:00:00Z",
-                    "createTime": "2026-06-06T00:00:00Z",
-                    "downloadUrl": (
-                        "https://youtubereporting.googleapis.com/v1/media/" + report_id
-                    ),
-                }
-            )
-            self.csv_by_id[report_id] = (
-                "date,channel_id,video_id,video_thumbnail_impressions,"
-                "video_thumbnail_impressions_ctr\n"
-                f"{day.replace('-', '')},UCchannel,video1,{impressions},{ctr}\n"
-            )
 
     def get(self, url, params=None, timeout=None, headers=None):
         path = urlparse(url).path
         if path.endswith("/channels") and params.get("mine") == "true":
-            return json_response({"items": [{"id": "UCchannel"}]})
+            return json_response(
+                {"items": [{"id": channel} for channel in self.channels]}
+            )
         if path.endswith("/channels"):
+            channel = params["id"]
             return json_response(
                 {
                     "items": [
                         {
-                            "id": "UCchannel",
+                            "id": channel,
                             "contentDetails": {"relatedPlaylists": {"uploads": "UU1"}},
                         }
                     ]
@@ -436,15 +319,8 @@ class Api:
                 }
             )
         if "youtubeanalytics.googleapis.com" in url:
+            self.analytics_ids.append(params["ids"])
             return json_response(self.analytics(params))
-        if path == "/v1/jobs":
-            return json_response({"jobs": self.jobs})
-        if path.endswith("/reports"):
-            return json_response({"reports": self.reports})
-        if path.startswith("/v1/media/"):
-            report_id = path.rsplit("/", 1)[-1]
-            self.downloads.append(report_id)
-            return json_response({}, content=self.csv_by_id[report_id].encode())
         if path == "/drive/v3/files":
             name = re.search(r"name = '([^']+)'", params["q"]).group(1)
             matches = [item for item in self.files.values() if item["name"] == name]
@@ -514,18 +390,9 @@ class Api:
 
     def post(self, url, params=None, data=None, headers=None, json=None, timeout=None):
         path = urlparse(url).path
-        if path == "/v1/jobs":
-            self.created_jobs += 1
-            job = {
-                "id": "job1",
-                "reportTypeId": json["reportTypeId"],
-                "createTime": "2026-06-01T00:00:00Z",
-            }
-            self.jobs.append(job)
-            return json_response(job)
         if path == "/upload/drive/v3/files":
             parts = multipart_parts(data, headers)
-            file_id = "stats-file"
+            file_id = f"file{len(self.created) + 1}"
             self.files[file_id] = {
                 "id": file_id,
                 "name": parts["meta"]["name"],
@@ -549,21 +416,15 @@ def test_export_stats_rerun_keeps_one_file_and_one_row(tmp_path):
     settings = Settings(
         youtube_channel_id="UCchannel",
         stats_drive_folder_id="statsfolder",
-        stats_state_path="reach.json",
     )
     first = export_stats(settings, tmp_path, http, clock=lambda: MOMENT)
-    downloads = len(http.downloads)
     second = export_stats(settings, tmp_path, http, clock=lambda: MOMENT)
-    assert http.created_jobs == 1
-    assert http.created == ["stats-file"]
-    assert http.updated == ["stats-file"]
-    assert len(http.downloads) == downloads == 4
-    assert first[0]["file_ids"] == second[0]["file_ids"] == ["stats-file"]
+    assert http.created == ["file1"]
+    assert http.updated == ["file1"]
+    assert first[0]["file_ids"] == second[0]["file_ids"] == ["file1"]
     assert first[0]["videos"] == second[0]["videos"] == 1
-    stored = json.loads((tmp_path / "reach.json").read_text(encoding="utf-8"))
-    assert stored["days"]["2026-06-01"]["videos"]["video1"]["impressions"] == 100
-    assert len(stored["days"]) == 4
-    parsed = list(csv.DictReader(io.StringIO(http.files["stats-file"]["csv"].decode())))
+    assert not (tmp_path / "data" / "stats-reach.json").exists()
+    parsed = list(csv.DictReader(io.StringIO(http.files["file1"]["csv"].decode())))
     assert len(parsed) == 1
     row = parsed[0]
     assert row["video_id"] == "video1"
@@ -575,21 +436,39 @@ def test_export_stats_rerun_keeps_one_file_and_one_row(tmp_path):
     assert row["average_view_duration_seconds_first_72h"] == "11.25"
     assert row["subscribers_gained_first_72h"] == "5.5"
     assert row["first_72h_analytics_complete"] == "true"
-    assert row["impressions_lifetime"] == "158"
-    assert row["impressions_ctr_lifetime"] == "0.202532"
-    assert row["impressions_first_72h"] == "155"
-    assert row["impressions_ctr_first_72h"] == "0.201613"
-    assert row["impressions_missing_days"] == "0"
-    assert row["first_72h_reach_complete"] == "true"
-    assert "channel_reach_basic_a1" in row["reach_api"]
+    assert "impressions" not in row
     assert "reports.query" in row["activity_api"]
     curve = json.loads(row["audience_retention_first_72h"])
     assert [point["elapsed_video_time_ratio"] for point in curve] == [0.25, 0.5]
     assert row["audience_retention_first_72h_end"] == "2026-06-04"
     assert ("2026-06-01", "2026-06-10") in http.retention
     assert ("2026-06-01", "2026-06-04") in http.retention
-    # A second pass of the same report must not be appended to the CSV.
-    assert http.files["stats-file"]["csv"].decode().count("video1") == 1
+    assert set(http.analytics_ids) == {"channel==UCchannel"}
+    assert http.files["file1"]["csv"].decode().count("video1") == 1
+
+
+def test_export_queries_each_configured_channel(tmp_path):
+    http = Api(channels=["UCchannel", "UCkids"])
+    settings = Settings(
+        youtube_channel_id="UCchannel",
+        stats_channels=[
+            {
+                "youtube_channel_id": "UCchannel",
+                "drive_folder_id": "foldera",
+                "label": "Midnight",
+            },
+            {
+                "youtube_channel_id": "UCkids",
+                "drive_folder_id": "folderb",
+                "label": "Kids",
+            },
+        ],
+    )
+    exported = export_stats(settings, tmp_path, http, clock=lambda: MOMENT)
+    assert [item["channel_id"] for item in exported] == ["UCchannel", "UCkids"]
+    assert http.created == ["file1", "file2"]
+    assert "channel==UCchannel" in http.analytics_ids
+    assert "channel==UCkids" in http.analytics_ids
 
 
 def test_export_stats_cli_requires_configuration(tmp_path, monkeypatch, capsys):

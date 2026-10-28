@@ -1,5 +1,4 @@
 from datetime import datetime
-from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -49,7 +48,6 @@ class Settings(Model):
     state_path: str = "data/state.json"
     cache_dir: str = "data/cache"
     stats_drive_folder_id: str | None = None
-    stats_state_path: str = "data/stats-reach.json"
     stats_channels: list[StatsChannel] = Field(default_factory=list)
 
     @field_validator("stats_drive_folder_id")
@@ -58,14 +56,6 @@ class Settings(Model):
         if value is None:
             return None
         return require_drive_id(value, "stats Drive folder ID")
-
-    @field_validator("stats_state_path")
-    @classmethod
-    def stats_path(cls, value):
-        path = Path(value)
-        if not value or path.is_absolute() or ".." in path.parts:
-            raise ValueError("stats_state_path must stay under the config directory")
-        return value
 
 
 class Video(Model):
