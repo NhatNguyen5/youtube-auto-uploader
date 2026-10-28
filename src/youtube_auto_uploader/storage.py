@@ -105,3 +105,6 @@ def validate_story_state(story):
             raise ValueError("Invalid source identity")
         if not isinstance(job.get("attempts"), int) or job["attempts"] < 0:
             raise ValueError("Invalid attempt count")
+        failures = job.get("consecutive_failures", 0)
+        if not isinstance(failures, int) or failures < 0:
+            raise ValueError("Invalid consecutive failure count")

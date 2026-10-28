@@ -11,7 +11,7 @@ from .storage import atomic_json
 # login requests every scope the commands need. drive.readonly reads the story
 # inbox and finds an existing stats file. drive.file creates and overwrites that
 # stats file only. youtube.force-ssl uploads and reads the channel.
-# yt-analytics.readonly covers YouTube Analytics reports.query.
+# yt-analytics.readonly covers Analytics reports.query and Reporting API jobs.
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/drive.file",
