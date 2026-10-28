@@ -9,7 +9,7 @@ import portalocker
 import pytest
 import requests
 
-from youtube_auto_uploader.drive import Drive
+from youtube_auto_uploader.drive import ApiError, Drive
 from youtube_auto_uploader.models import Settings, Story
 from youtube_auto_uploader.runner import Runner
 from youtube_auto_uploader.storage import Store, atomic_json, parse_json
@@ -253,6 +253,109 @@ def test_expired_session_requires_review(tmp_path):
     assert http.put.call_count == 1
 
 
+def test_alternating_blips_keep_first_backoff(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    job = record["jobs"]["long"]
+    job.update(stage="uploading", session=SESSION)
+    clock = {"now": NOW}
+    runner.clock = lambda: clock["now"]
+    mode = {"fail": True}
+
+    def transfer(job, path, save):
+        if mode["fail"]:
+            raise requests.ConnectionError("blip")
+        job["offset"] = job.get("offset", 0) + 1
+        save()
+
+    youtube.transfer.side_effect = transfer
+    for _ in range(12):
+        mode["fail"] = True
+        runner.process("story", "long", record)
+        assert job["stage"] != "needs_review"
+        assert job["consecutive_failures"] == 1
+        retry_at = datetime.fromisoformat(job["next_retry"])
+        delay = (retry_at - clock["now"]).total_seconds()
+        assert 60 <= delay <= 70
+        clock["now"] = retry_at
+        mode["fail"] = False
+        runner.process("story", "long", record)
+        assert job["stage"] != "needs_review"
+        assert job["consecutive_failures"] == 0
+        assert "next_retry" not in job
+    saved = store.load()["stories"]["story"]["jobs"]["long"]
+    assert saved["stage"] == "uploading"
+    assert saved["attempts"] == 12
+    assert saved["consecutive_failures"] == 0
+    assert "next_retry" not in saved
+
+
+def test_schedule_failures_back_off_until_review(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    job = record["jobs"]["long"]
+    record["snapshot"]["videos"]["long"]["publish_at"] = (
+        NOW + timedelta(days=2)
+    ).isoformat()
+    job.update(stage="uploaded", video_id="known")
+    clock = {"now": NOW}
+    runner.clock = lambda: clock["now"]
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "private", "uploadStatus": "processed"},
+        "processingDetails": {"processingStatus": "succeeded"},
+    }
+    youtube.schedule.side_effect = ApiError(503, "backendError")
+    delays = []
+    for _ in range(9):
+        runner.process("story", "long", record)
+        assert job["stage"] != "needs_review"
+        retry_at = datetime.fromisoformat(job["next_retry"])
+        delays.append((retry_at - clock["now"]).total_seconds())
+        clock["now"] = retry_at
+    runner.process("story", "long", record)
+    assert job["stage"] == "needs_review"
+    assert job["consecutive_failures"] == 10
+    assert youtube.inspect.call_count == 10
+    assert youtube.schedule.call_count == 10
+    for delay, base in zip(
+        delays, [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600], strict=True
+    ):
+        assert base <= delay <= base + 10
+
+
+def test_schedule_margin_cap_respects_retry_after(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    job = record["jobs"]["long"]
+    job.update(stage="uploading", session=SESSION)
+    publish_at = Story.model_validate(record["snapshot"]).videos["long"].publish_at
+    margin = timedelta(seconds=runner.settings.schedule_margin_seconds)
+    clock = {"now": publish_at - margin - timedelta(seconds=30)}
+    runner.clock = lambda: clock["now"]
+
+    def delay_after(error):
+        job.pop("next_retry", None)
+        youtube.transfer.side_effect = error
+        runner.process("story", "long", record)
+        return (
+            datetime.fromisoformat(job["next_retry"]) - clock["now"]
+        ).total_seconds()
+
+    capped = delay_after(requests.ConnectionError("blip"))
+    assert capped == pytest.approx(30)
+
+    clock["now"] = publish_at - margin - timedelta(seconds=30)
+    honored = delay_after(ApiError(429, "rateLimitExceeded", 180))
+    assert honored == pytest.approx(180)
+
+    clock["now"] = publish_at - margin - timedelta(milliseconds=250)
+    tiny = delay_after(requests.ConnectionError("blip"))
+    assert tiny >= 60
+
+
 def test_network_failure_preserves_session_and_backs_off(setup):
     runner, store, drive, youtube = setup
     runner.discover()
@@ -355,9 +458,69 @@ def test_changed_source_stops_download(tmp_path):
     drive.http.get.assert_not_called()
 
 
-def test_incomplete_session_no_progress_does_not_loop(tmp_path):
-    from youtube_auto_uploader.drive import ApiError
+def _http_error(status, reason):
+    error = requests.HTTPError("secret URL must not be logged")
+    error.response = Mock(status_code=status, reason=reason)
+    return error
 
+
+@pytest.mark.parametrize(
+    ("failure", "reported"),
+    [
+        (ApiError(403, "fileNotDownloadable"), "HTTP 403: fileNotDownloadable"),
+        (requests.ConnectionError("secret URL must not be logged"), "ConnectionError"),
+        (_http_error(404, "notFound"), "HTTP 404: notFound"),
+    ],
+)
+def test_story_discovery_error_does_not_block_other_stories(setup, failure, reported):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    drive.children.return_value = [
+        {
+            "id": "folder-a",
+            "name": "Broken",
+            "mimeType": "application/vnd.google-apps.folder",
+        },
+        {
+            "id": "folder-b",
+            "name": "Ready",
+            "mimeType": "application/vnd.google-apps.folder",
+        },
+    ]
+
+    def story(folder_id):
+        if folder_id == "folder-a":
+            raise failure
+        return (
+            Story.model_validate(story_data()),
+            {role: source(role) for role in ("long", "short")},
+        )
+
+    drive.story.side_effect = story
+    runner.cycle()
+    assert set(runner.state["stories"]) == {"folder-b"}
+    assert set(runner.state["stories"]["folder-b"]["jobs"]) == {"long", "short"}
+    assert {call.args[1]["id"] for call in youtube.start.call_args_list} == {
+        "long",
+        "short",
+    }
+    text = "\n".join(reports)
+    assert f"Story folder-a: {reported}" in text
+    assert "secret URL" not in text
+
+
+def test_root_listing_api_error_still_stops_the_cycle(setup):
+    runner, store, drive, youtube = setup
+    drive.children.side_effect = ApiError(404, "notFound")
+    with pytest.raises(ApiError, match="404") as caught:
+        runner.cycle()
+    assert caught.value.reason == "notFound"
+    youtube.start.assert_not_called()
+    drive.story.assert_not_called()
+
+
+def test_incomplete_session_no_progress_does_not_loop(tmp_path):
     path = tmp_path / "video"
     path.write_bytes(b"abc")
     http = Mock()
