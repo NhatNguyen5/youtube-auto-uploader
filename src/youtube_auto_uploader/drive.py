@@ -108,10 +108,7 @@ class Drive:
         story = Story.model_validate(parse_json(content.decode("utf-8-sig")))
         sources = {role: unique(video.filename) for role, video in story.videos.items()}
         for source in sources.values():
-            if (
-                not source.get("mimeType", "").startswith("video/")
-                or int(source.get("size", 0)) <= 0
-            ):
+            if not is_video(source) or int(source.get("size", 0)) <= 0:
                 raise ValueError("Source must be a nonempty video file")
             if not source.get("capabilities", {}).get("canDownload", False):
                 raise ValueError("Source does not permit downloads")
@@ -240,6 +237,16 @@ class Drive:
                 timeout=120,
             )
         return checked(response).json()["id"]
+
+
+def is_video(source):
+    mime = source.get("mimeType", "")
+    name = source.get("name", "")
+    return (
+        mime.startswith("video/")
+        or mime == "application/mp4"
+        or name.lower().endswith(".mp4")
+    )
 
 
 def fingerprint(source):

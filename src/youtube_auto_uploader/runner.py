@@ -203,9 +203,10 @@ class Runner:
                 }
                 self.save()
             except (ValueError, ValidationError) as error:
-                # Do not print validation payloads, which may contain remote content.
                 self.report(
-                    f"Story {sid}: waiting for valid config and two unique videos ({type(error).__name__})"
+                    "Story "
+                    f"{sid}: waiting for valid config and two unique videos "
+                    f"({type(error).__name__}: {error})"
                 )
             except ApiError as error:
                 self.report(f"Story {sid}: HTTP {error.status}: {error.reason}")

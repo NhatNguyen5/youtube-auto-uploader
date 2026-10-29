@@ -457,6 +457,77 @@ def test_duplicate_drive_configs_rejected():
         drive.story("story")
 
 
+class _ConfigMedia:
+    def __init__(self, payload):
+        self.status_code = 200
+        self.headers = {}
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_content(self, chunk):
+        yield self.payload
+
+
+def read_story(files, config):
+    drive = Drive(Mock())
+    drive.children = Mock(return_value=files)
+    drive.http.get.return_value = _ConfigMedia(json.dumps(config).encode())
+    return drive.story("story")
+
+
+@pytest.mark.parametrize(
+    ("mime", "filename"),
+    [
+        ("application/mp4", "long.mp4"),
+        ("application/mp4", "clip"),
+        ("application/octet-stream", "long.MP4"),
+    ],
+)
+def test_story_accepts_mp4_without_video_mime(mime, filename):
+    data = story_data()
+    data["videos"]["long"]["filename"] = filename
+    long = source("long")
+    long.update(name=filename, mimeType=mime)
+    story, sources = read_story(
+        [{"name": "config.json", "id": "config"}, long, source("short")],
+        data,
+    )
+    assert sources["long"]["mimeType"] == mime
+    assert sources["long"]["name"] == filename
+    assert story.videos["long"].filename == filename
+
+
+def test_story_rejects_non_video_file():
+    data = story_data()
+    data["videos"]["long"]["filename"] = "notes.txt"
+    notes = source("long")
+    notes.update(name="notes.txt", mimeType="application/pdf")
+    with pytest.raises(ValueError, match="Source must be a nonempty video file"):
+        read_story(
+            [{"name": "config.json", "id": "config"}, notes, source("short")],
+            data,
+        )
+
+
+def test_waiting_log_includes_story_error(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    drive.story.side_effect = ValueError("Source must be a nonempty video file")
+    runner.discover()
+    assert runner.state["stories"] == {}
+    assert reports == [
+        "Story story: waiting for valid config and two unique videos "
+        "(ValueError: Source must be a nonempty video file)"
+    ]
+    youtube.start.assert_not_called()
+
+
 def test_corrupt_uploaded_state_cannot_become_new_job(setup):
     runner, store, drive, youtube = setup
     runner.discover()
