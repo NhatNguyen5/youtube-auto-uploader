@@ -107,6 +107,9 @@ def validate_story_state(story):
             raise ValueError("Invalid attempt count")
         if "log_recorded" in job and not isinstance(job["log_recorded"], bool):
             raise ValueError("Invalid upload log flag")
+        failures = job.get("consecutive_failures", 0)
+        if not isinstance(failures, int) or failures < 0:
+            raise ValueError("Invalid consecutive failure count")
 
 
 def upload_log_job_id(channel_id, story_id, role):

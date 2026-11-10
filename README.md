@@ -8,7 +8,7 @@ The initial implementation is available. Automated tests use fake Google service
 
 1. Install uv and run `uv sync --locked` in this project.
 2. Copy `examples/config.example.json` to `config.json` if it does not exist. Set `youtube_channel_id` to your channel's ID (not its handle). The MidnightUntold Drive root ID is already configured.
-3. Enable Google Drive API and YouTube Data API in your Google Cloud project, configure OAuth consent, and create a **Desktop app** OAuth client. If your consent screen is in testing, add your Google account as a test user.
+3. Enable Google Drive API, YouTube Data API, YouTube Analytics API, and YouTube Reporting API in your Google Cloud project, configure OAuth consent, and create a **Desktop app** OAuth client. If your consent screen is in testing, add your Google account as a test user. Add the scopes listed in [.env.example](.env.example) to the consent screen. After this list changes, stop the uploader, run `login` again, then start the uploader.
 4. Fill `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`. See [.env.example](.env.example). Login saves refreshable credentials to `GOOGLE_TOKEN_PATH`, defaulting to `secrets/token.json`. Environment variables take precedence over .env. Keep this project in a directory accessible only to your user account.
 5. Run the commands below. `init-state` is for a new installation only; never delete history to resolve a failure.
 
@@ -29,6 +29,75 @@ uv run youtube-auto-uploader validate --story examples/story-config.example.json
 
 The runner holds an exclusive state lock. Stop it before using `status`; concurrent processes cannot change its history. Paths in config and .env are relative to the config directory. An alternate config can be selected before the subcommand: `uv run youtube-auto-uploader --config C:\path\config.json status`.
 
+## Weekly stats export
+
+`export-stats` writes one CSV per channel per ISO week into `stats_drive_folder_id`. The week is the America/Los_Angeles date of the run. A rerun of that same week overwrites that file and does not add another row for a video. Scheduling is not installed for you.
+
+Set `stats_drive_folder_id` in `config.json` to a Drive folder the signed-in user can add files to, and share that folder with whoever reads the numbers. The file name is `youtube-stats-<channel id>-<year>-W<week>.csv`. Thumbnail-impression history is kept in `stats_state_path` (default `data/stats-reach.json`) because YouTube deletes Reporting API files after 30 days (historical backfill) or 60 days (later daily files). Deleting that local file drops impression days that YouTube no longer serves.
+
+Only MidnightUntold is configured today. `stats_channels` can name that one channel (`youtube_channel_id`, `drive_folder_id`, and an optional `label`). A non-empty list replaces `stats_drive_folder_id`. The Reporting API reach job covers only the channel this login is scoped to, and there is no channel argument on the job. A config with more than one `stats_channels` entry, or a channel id other than that authenticated channel, stops the export instead of writing blank impression columns. A later kids channel needs its own login and config until reach can be requested per channel.
+
+```powershell
+uv run youtube-auto-uploader export-stats
+uv run youtube-auto-uploader export-stats --week 2026-W44
+```
+
+`--week` only chooses which weekly file to overwrite. The numbers are always the stats available at the time of the run.
+
+Stop the uploader before the first `login` after this change, then schedule a separate weekly task. It uses `data/stats-reach.json.lock`, not the upload lock, so it can run while `run` is already up. On Windows Task Scheduler, use the same `uv` program and project paths as the uploader task, with arguments `run --project "C:\Users\nhatn\Projects\youtube-auto-uploader" youtube-auto-uploader --config "C:\Users\nhatn\Projects\youtube-auto-uploader\config.json" export-stats`, weekly, and do not start a second copy if one is running. A cron equivalent, Monday 09:15 Pacific:
+
+```cron
+CRON_TZ=America/Los_Angeles
+15 9 * * 1 cd /absolute/path/youtube-auto-uploader && uv run youtube-auto-uploader export-stats
+```
+
+### Where each column comes from
+
+Checked against the YouTube Analytics and Reporting docs (metrics list, channel reports, and the 15 January 2026 revision that added reach reports).
+
+| Columns | API | Fields |
+| --- | --- | --- |
+| `views_lifetime`, `views_first_72h` | YouTube Analytics API `reports.query` | `views` |
+| `average_view_duration_seconds_lifetime` | YouTube Analytics API `reports.query` | `averageViewDuration` (seconds) |
+| `average_view_duration_seconds_first_72h` | YouTube Analytics API `reports.query` | view-weighted `averageViewDuration` on `day` rows |
+| `subscribers_gained_lifetime`, `subscribers_gained_first_72h` | YouTube Analytics API `reports.query` | `subscribersGained`. A per-video query only counts subscriptions from that video's watch page. |
+| `audience_retention_lifetime`, `audience_retention_first_72h` | YouTube Analytics API `reports.query` | `audienceWatchRatio` and `relativeRetentionPerformance` by `elapsedVideoTimeRatio` (100 points, one video per request) |
+| `impressions_lifetime`, `impressions_first_72h`, `impressions_ctr_lifetime`, `impressions_ctr_first_72h` | YouTube Reporting API job `channel_reach_basic_a1` | `video_thumbnail_impressions` and `video_thumbnail_impressions_ctr` |
+
+Thumbnail impressions and thumbnail click-through rate are not metrics of `reports.query`. Card and annotation impressions are a different thing and are not used. The Reporting API defines `video_thumbnail_impressions_ctr` as clicks divided by impressions, so `0.0443` means 4.43% rather than a 0–100 number. The export stores that ratio as returned. It does not decide percent versus ratio one cell at a time, because a 0.8 in a percent file would be left as 80% while a 4.43 next to it was divided by 100. Bulk report dates are accepted as `YYYYMMDD` (what downloaded files use) or `YYYY-MM-DD`.
+
+Lifetime activity is the basic user-activity report: no `dimensions`, `filters=video==` one video id. The 72-hour rows are `dimensions=day` with that same single-video filter. `dimensions=video` is only the top-videos report, which requires `sort` and does not take a video filter. `dimensions=day,video` is not a listed channel report. Each uploaded video therefore costs its own Analytics calls (lifetime, the short daily window, and two retention curves), run one after another. A daily call is skipped when that video's 72-hour window is still entirely after `analytics_last_day`.
+
+A cell whose text starts with `=`, `+`, `-`, or `@` is prefixed with an apostrophe so a spreadsheet does not treat a title as a formula.
+
+`analytics_last_day` is the newest Pacific day returned for a channel-level `views,averageViewDuration,subscribersGained` query over the 28 days ending today. Analytics leaves out the most recent days. A day with no channel activity can also be absent, which keeps `first_72h_analytics_complete` false without changing totals that would only have added zero. If that 28-day probe has no rows, the column is blank and the 72-hour scalar cells are left empty; lifetime activity is still requested through today.
+
+The reach job is created once per login (`youtube-auto-uploader reach`). YouTube then generates each Pacific day, including about 30 days before the job was created, and posts a day about two days later. A newer file for the same day replaces the stored day. `impressions_missing_days` is how many Pacific days from publication through the newest stored report were never ingested, so the lifetime impression total can be low for videos published before that history. Those cells are not filled with zero.
+
+### First 72 hours
+
+There is no hour dimension for these metrics. A day is midnight to midnight in America/Los_Angeles. Clocks moving for daylight saving make that day 23 or 25 hours.
+
+The window is `[published_at, published_at + 72 hours)`. For a public video, `published_at` is `snippet.publishedAt` (when it became public, which can be later than the upload). While a video is still private and has `status.publishAt`, that scheduled public time is used instead.
+
+- The Pacific publish day counts in full. Playback cannot start before publication, so scaling that bucket down would drop views that belong in the window.
+- A later day that sits entirely inside the window counts in full.
+- The trailing day is multiplied by the fraction of that Pacific day that is inside the 72 hours. Views, watch time (via `averageViewDuration`), subscribers gained, and impressions are scaled. This assumes activity is spread evenly across that last day.
+- Days after `analytics_last_day`, or reach days with no ingested report, are omitted rather than stored as zero. `first_72h_analytics_complete` and `first_72h_reach_complete` stay false until every overlapping day is available. The next weekly run overwrites the same file with the filled-in numbers.
+- Audience retention is requested for the overlapping Pacific dates. It is a curve, not a count, so the trailing day is not scaled. `audience_retention_first_72h_end` is the last date actually queried.
+
+`first_72h_days` records each overlapping date, the fraction used for the scalar metrics, and whether that Analytics day was included. The same fraction rules are in `first_72h_method` inside the CSV.
+
+### Dry run
+
+This repo has no YouTube credentials. After `login`, point `stats_drive_folder_id` at a folder you can open and run:
+
+```powershell
+uv run youtube-auto-uploader export-stats
+```
+
+Open that week's CSV and `data/stats-reach.json`. Reach days should be `YYYY-MM-DD`, with one CSV row per video. Run the same command again and confirm Drive still has one file for the week. The automated check that does not need a login is `uv run pytest -q tests/test_stats.py`.
+
 ## Drive layout
 
 ```text
@@ -44,6 +113,10 @@ MidnightUntold/
 ```
 
 Copy [the story template](examples/story-config.example.json) into each story folder as config.json. Fill both videos' metadata and future publication times with explicit timezone offsets, then set `enabled` to true. Each filename can be changed explicitly in the story config. Both files must be present and uniquely named before either video starts. Extra files are ignored. Folders can be renamed without creating new jobs.
+
+Each video requires `made_for_kids` and `contains_synthetic_media` as booleans. A story that omits either one is rejected; the uploader does not fill them in. The story template sets both to `false`. That is the safe MidnightUntold starting point: the video is not made for kids, and it has no realistic altered or synthetic content to disclose. Change the flags on that video when that is wrong. Long and short are independent, so a later kids channel can set `made_for_kids` to `true` in its own story configs. There is no separate kids-channel mode.
+
+Upload and the later schedule update send `made_for_kids` as `status.selfDeclaredMadeForKids` and `contains_synthetic_media` as `status.containsSyntheticMedia` (`videos.insert` and `videos.update`, part `status`). YouTube's `status.madeForKids` is a derived value and is not written. The Data API has no general "AI was used" field. `containsSyntheticMedia` discloses realistic altered or synthetic content, such as a real person shown doing something they did not do, altered footage of a real event or place, or a realistic scene that did not occur.
 
 The default preparation window is three hours. The machine must be awake and online to download, upload, and submit the schedule. YouTube handles publication after accepting it. Processing time varies, so increase `upload_lead_minutes` for large videos. The short filename identifies your intended variant; YouTube determines Shorts classification.
 
