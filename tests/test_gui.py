@@ -5,17 +5,23 @@ import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import portalocker
 import pytest
 
-from youtube_auto_uploader.cli import install_console_interrupt_handler, main
+from youtube_auto_uploader.cli import (
+    install_console_interrupt_handler,
+    interruptible_sleep,
+    main,
+)
 from youtube_auto_uploader.desktop import (
     ACTIONS,
     BUTTONS,
     RUNNER_ACTIVE,
+    CommandRun,
     Operator,
     StatusSnapshot,
     button_state,
@@ -287,6 +293,88 @@ def test_main_installs_the_break_handler_before_parsing(monkeypatch):
     assert called == [True]
 
 
+def test_sleep_is_one_call_off_windows(monkeypatch):
+    slept = []
+    monkeypatch.setattr("youtube_auto_uploader.cli.sys.platform", "linux")
+    monkeypatch.setattr(
+        "youtube_auto_uploader.cli.time.sleep", lambda seconds: slept.append(seconds)
+    )
+    interruptible_sleep(3.2)
+    assert slept == [3.2]
+
+
+def test_windows_sleep_returns_to_the_interpreter_every_second(monkeypatch):
+    slept = []
+    clock = {"now": 100.0}
+    monkeypatch.setattr("youtube_auto_uploader.cli.sys.platform", "win32")
+    monkeypatch.setattr(
+        "youtube_auto_uploader.cli.time.monotonic", lambda: clock["now"]
+    )
+
+    def sleep(seconds):
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr("youtube_auto_uploader.cli.time.sleep", sleep)
+    interruptible_sleep(2.5)
+    assert slept == [1.0, 1.0, 0.5]
+
+
+def test_sleep_slice_lets_keyboard_interrupt_propagate(monkeypatch):
+    monkeypatch.setattr("youtube_auto_uploader.cli.sys.platform", "win32")
+
+    def sleep(_seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("youtube_auto_uploader.cli.time.sleep", sleep)
+    with pytest.raises(KeyboardInterrupt):
+        interruptible_sleep(30)
+
+
+def test_run_loop_uses_the_sliced_sleep():
+    text = Path("src/youtube_auto_uploader/cli.py").read_text(encoding="utf-8")
+    assert "interruptible_sleep(" in text
+    assert "time.sleep(settings.poll_seconds" not in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="CTRL_BREAK_EVENT is Windows-only")
+def test_ctrl_break_runs_the_keyboard_interrupt_handler():
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "from youtube_auto_uploader.cli import (",
+                    "    install_console_interrupt_handler,",
+                    "    interruptible_sleep,",
+                    ")",
+                    "install_console_interrupt_handler()",
+                    "try:",
+                    "    interruptible_sleep(30)",
+                    "except KeyboardInterrupt:",
+                    "    print('Stopped.', flush=True)",
+                    "    raise SystemExit(130)",
+                    "raise SystemExit(0)",
+                ]
+            ),
+        ],
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        time.sleep(0.5)
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+        output, _ = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 130
+    assert "Stopped." in output
+
+
 def test_console_interrupt_is_ctrl_c_and_not_kill():
     if sys.platform == "win32":
         assert console_interrupt() == signal.CTRL_BREAK_EVENT
@@ -380,6 +468,74 @@ def test_output_streams_until_the_process_exits(tmp_path):
         )
     else:
         assert run.process.kwargs["start_new_session"] is True
+
+
+def test_exit_event_is_queued_after_the_command_is_done(monkeypatch):
+    monkeypatch.setattr(threading.Thread, "start", lambda _self: None)
+    run = CommandRun(FakeProcess([], LineStream([])), "run")
+    seen = []
+    original = run.events.put
+
+    def spy(item, *args, **kwargs):
+        if item[0] == "exit":
+            seen.append(run.done)
+        original(item, *args, **kwargs)
+
+    run.events.put = spy
+    run._pump()
+    assert seen == [True]
+
+
+def test_failed_signal_is_not_a_kill(tmp_path):
+    stream = HeldStream()
+
+    class Boom(FakeProcess):
+        def send_signal(self, sig):
+            raise OSError("no console")
+
+    def popen(argv, **kwargs):
+        return Boom(argv, stream, **kwargs)
+
+    operator = Operator(tmp_path / "config.json", popen=popen)
+    try:
+        operator.start("run")
+        assert operator.stop_runner() is False
+        assert operator.current.process.killed is False
+        assert operator.current.process.terminated is False
+        assert operator.current._interrupted is False
+    finally:
+        stream.queue.put("")
+
+
+def test_close_destroys_the_window_when_interrupt_fails():
+    from youtube_auto_uploader.gui import DesktopWindow
+
+    window = DesktopWindow.__new__(DesktopWindow)
+    window._closed = False
+
+    class Op:
+        def interrupt_current(self):
+            raise OSError("no console")
+
+    window.operator = Op()
+    destroyed = []
+
+    class Root:
+        def destroy(self):
+            destroyed.append(True)
+
+    window.root = Root()
+
+    class Tk:
+        class TclError(Exception):
+            pass
+
+    window.tk = Tk()
+    window.close()
+    assert window._closed is True
+    assert destroyed == [True]
+    window.close()
+    assert destroyed == [True]
 
 
 def test_stop_sends_ctrl_c_and_does_not_kill(tmp_path):

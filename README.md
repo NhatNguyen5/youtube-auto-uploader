@@ -148,7 +148,7 @@ uv run youtube-auto-uploader gui
 - **Validate** runs `validate`. It checks that `config.json` loads. It does not call Google and does not upload. The result stays in the checks box.
 - **Validate remote** runs `validate --remote`. It checks the saved credentials, that the signed-in channel matches `youtube_channel_id`, and that each Drive story config is valid. It lists each valid story id and does not upload.
 - **Start runner** runs continuous `run`. Its output streams into the log. The other command buttons stay off until it stops.
-- **Stop runner** asks the runner to stop the way Ctrl+C does. On Windows the window sends Ctrl+Break, because a separate process group ignores Ctrl+C, and the uploader handles that as the same KeyboardInterrupt. It does not terminate or kill the process, including during an upload. `run` releases the state lock and logs `Stopped. Saved upload sessions will be reconciled on restart.`
+- **Stop runner** asks the runner to stop the way Ctrl+C does. On Windows the window sends Ctrl+Break, because a separate process group ignores Ctrl+C. The uploader handles Ctrl+Break as KeyboardInterrupt instead of letting Windows exit the process. A poll or quota wait notices the stop within a second. An upload already in progress is not killed. `run` releases the state lock and logs `Stopped. Saved upload sessions will be reconciled on restart.`
 - **Run once** runs `run --once` (one pass, then exit).
 - **Export stats** runs `export-stats` for the current Pacific week.
 

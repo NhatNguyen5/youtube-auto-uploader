@@ -184,9 +184,12 @@ def cli_argv(config, action):
 def console_interrupt():
     """Signal the child the way Ctrl+C does.
 
-    On Windows a new process group ignores CTRL_C_EVENT. CTRL_BREAK_EVENT is
-    delivered as SIGBREAK, and the CLI turns that into KeyboardInterrupt.
-    Elsewhere this is SIGINT.
+    On Windows a new process group ignores CTRL_C_EVENT, so this sends
+    CTRL_BREAK_EVENT. That arrives as SIGBREAK. Python's default for SIGBREAK
+    is to exit the process (0xC000013A) without KeyboardInterrupt or finally
+    blocks. ``install_console_interrupt_handler`` installs the SIGINT handler
+    on SIGBREAK, and the run loop sleeps in one-second slices because
+    SIGBREAK does not wake ``time.sleep``. Elsewhere this is SIGINT.
     """
     if sys.platform == "win32":
         return signal.CTRL_BREAK_EVENT
@@ -252,8 +255,10 @@ class CommandRun:
                     pass
             code = self.process.wait()
             self.returncode = code
-            self.events.put(("exit", code))
+            # Mark finished before the exit event. The window syncs buttons
+            # when it drains that event, and must not still see this as running.
             self.done = True
+            self.events.put(("exit", code))
 
     def drain(self):
         events = []
@@ -272,7 +277,10 @@ class CommandRun:
         with self._signal_lock:
             if self._interrupted or self.done or self.process.poll() is not None:
                 return False
-            self.process.send_signal(console_interrupt())
+            try:
+                self.process.send_signal(console_interrupt())
+            except (OSError, ValueError):
+                return False
             self._interrupted = True
             return True
 

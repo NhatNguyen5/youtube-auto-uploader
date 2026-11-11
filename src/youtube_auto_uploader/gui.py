@@ -239,7 +239,10 @@ class DesktopWindow:
         if self._closed:
             return
         self._closed = True
-        self.operator.interrupt_current()
+        try:
+            self.operator.interrupt_current()
+        except Exception:
+            pass
         try:
             self.root.destroy()
         except self.tk.TclError:

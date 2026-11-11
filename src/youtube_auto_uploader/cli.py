@@ -61,6 +61,25 @@ def install_console_interrupt_handler():
     signal.signal(signal.SIGBREAK, signal.default_int_handler)
 
 
+def interruptible_sleep(seconds):
+    """Sleep for ``seconds``.
+
+    On Windows, SIGBREAK does not wake ``time.sleep``. A poll or quota wait
+    can last for hours, so sleep at most one second at a time and let the
+    pending KeyboardInterrupt run between slices. Other platforms keep one
+    sleep, which SIGINT already interrupts.
+    """
+    if sys.platform != "win32" or seconds <= 1:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
+
+
 def main():
     install_console_interrupt_handler()
     parser = argparse.ArgumentParser(
@@ -182,7 +201,9 @@ def main():
                     persist()
                     if args.once:
                         break
-                    time.sleep(settings.poll_seconds if pause is None else pause)
+                    interruptible_sleep(
+                        settings.poll_seconds if pause is None else pause
+                    )
             finally:
                 persist()
                 http.close()
