@@ -133,6 +133,27 @@ Each variant has its own saved upload session, video ID, and publication status.
 - Transferring one video blocks the single worker until it completes or errors. Processing checks run between transfers; allow ample preparation time for all due videos.
 - Thumbnails, playlists, captions, recursive folders, and Drive shortcuts are not supported yet.
 
+## Desktop app (Windows)
+
+The window runs the same commands as the terminal. It does not upload by another path, and it has no `init-state` button.
+
+```powershell
+uv run youtube-auto-uploader gui
+```
+
+`--config` still comes before the subcommand: `uv run youtube-auto-uploader --config C:\path\config.json gui`.
+
+- **Refresh** shows the same lines as `status`: one line per story variant (`long` and `short`) with the stage, the YouTube URL when a video id is saved, and any error text. With no stories yet, it says `No stories started yet.` If `run` already holds the state lock, from this window or from a terminal, it shows `Runner is active, status locked`. That check does not wait and does not release the lock.
+- **Login** runs `login` and opens the browser for OAuth.
+- **Validate** runs `validate`. It checks that `config.json` loads. It does not call Google and does not upload. The result stays in the checks box.
+- **Validate remote** runs `validate --remote`. It checks the saved credentials, that the signed-in channel matches `youtube_channel_id`, and that each Drive story config is valid. It lists each valid story id and does not upload.
+- **Start runner** runs continuous `run`. Its output streams into the log. The other command buttons stay off until it stops.
+- **Stop runner** is Ctrl+C. It does not terminate or kill the process, including during an upload. `run` handles that interrupt the way it does in a terminal, releases the state lock, and logs `Stopped. Saved upload sessions will be reconciled on restart.`
+- **Run once** runs `run --once` (one pass, then exit).
+- **Export stats** runs `export-stats` for the current Pacific week.
+
+The log shows whichever command is running. Closing the window sends that same interrupt if a command is still running. Commands run outside the window's main thread, so the window stays responsive while they work. Refresh stays available.
+
 ## Windows startup
 
 After a live test succeeds, create a Windows Task Scheduler task under the same user account. Use the absolute path from `Get-Command uv`, arguments `run --project "C:\Users\nhatn\Projects\youtube-auto-uploader" youtube-auto-uploader --config "C:\Users\nhatn\Projects\youtube-auto-uploader\config.json" run`, and set the project directory as **Start in**. Configure restart on failure and prevent overlapping instances. No task is installed automatically. Initial OAuth login must be completed interactively first.

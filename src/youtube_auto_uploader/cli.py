@@ -70,7 +70,16 @@ def main():
         "--week",
         help="ISO week file to overwrite, such as 2026-W44. Defaults to the current Pacific week.",
     )
+    commands.add_parser(
+        "gui",
+        help="Open the desktop window",
+        description="Open the desktop window",
+    )
     args = parser.parse_args()
+    if args.command == "gui":
+        from .gui import launch
+
+        return launch(args.config)
     base = args.config.resolve().parent
     try:
         if args.command == "login":
