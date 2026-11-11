@@ -1,4 +1,6 @@
 import argparse
+import signal
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,7 +48,21 @@ def export_command(settings, base, week):
     return 0
 
 
+def install_console_interrupt_handler():
+    """Let Windows Ctrl+Break reach the KeyboardInterrupt handler.
+
+    Python installs that handler for SIGINT only. CTRL_BREAK_EVENT arrives as
+    SIGBREAK, and the default action is ExitProcess, which skips finally
+    blocks. A new process group ignores Ctrl+C, so the desktop Stop button
+    sends Ctrl+Break instead.
+    """
+    if sys.platform != "win32":
+        return
+    signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
+
 def main():
+    install_console_interrupt_handler()
     parser = argparse.ArgumentParser(
         description="Upload Drive story pairs and schedule publication"
     )

@@ -184,8 +184,9 @@ def cli_argv(config, action):
 def console_interrupt():
     """Signal the child the way Ctrl+C does.
 
-    On Windows a new process group ignores CTRL_C_EVENT, and CTRL_BREAK_EVENT
-    is delivered to that group as KeyboardInterrupt. Elsewhere this is SIGINT.
+    On Windows a new process group ignores CTRL_C_EVENT. CTRL_BREAK_EVENT is
+    delivered as SIGBREAK, and the CLI turns that into KeyboardInterrupt.
+    Elsewhere this is SIGINT.
     """
     if sys.platform == "win32":
         return signal.CTRL_BREAK_EVENT

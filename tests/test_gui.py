@@ -11,6 +11,7 @@ from pathlib import Path
 import portalocker
 import pytest
 
+from youtube_auto_uploader.cli import install_console_interrupt_handler, main
 from youtube_auto_uploader.desktop import (
     ACTIONS,
     BUTTONS,
@@ -242,6 +243,48 @@ def test_check_text_and_log_header():
     failed = check_result_text("validate_remote", ["Error: token\n"], 1)
     assert failed.startswith("Validate remote: failed (exit 1)\nError: token")
     assert check_result_text("run", ["Stopped.\n"], 130) is None
+
+
+def test_sigbreak_handler_is_not_installed_off_windows(monkeypatch):
+    monkeypatch.setattr(
+        "youtube_auto_uploader.cli.sys.platform",
+        "linux",
+    )
+
+    def fail(*_args):
+        raise AssertionError("signal.signal should not be called")
+
+    monkeypatch.setattr("youtube_auto_uploader.cli.signal.signal", fail)
+    install_console_interrupt_handler()
+
+
+def test_windows_sigbreak_uses_the_keyboard_interrupt_handler(monkeypatch):
+    monkeypatch.setattr("youtube_auto_uploader.cli.sys.platform", "win32")
+    monkeypatch.setattr("youtube_auto_uploader.cli.signal.SIGBREAK", 21, raising=False)
+    handler = object()
+    monkeypatch.setattr("youtube_auto_uploader.cli.signal.default_int_handler", handler)
+    calls = {}
+
+    def record(number, installed):
+        calls["number"] = number
+        calls["handler"] = installed
+
+    monkeypatch.setattr("youtube_auto_uploader.cli.signal.signal", record)
+    install_console_interrupt_handler()
+    assert calls == {"number": 21, "handler": handler}
+
+
+def test_main_installs_the_break_handler_before_parsing(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        "youtube_auto_uploader.cli.install_console_interrupt_handler",
+        lambda: called.append(True),
+    )
+    monkeypatch.setattr(sys, "argv", ["youtube-auto-uploader", "--help"])
+    with pytest.raises(SystemExit) as caught:
+        main()
+    assert caught.value.code == 0
+    assert called == [True]
 
 
 def test_console_interrupt_is_ctrl_c_and_not_kill():
