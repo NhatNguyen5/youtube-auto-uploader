@@ -316,8 +316,12 @@ def test_windows_sleep_returns_to_the_interpreter_every_second(monkeypatch):
         clock["now"] += seconds
 
     monkeypatch.setattr("youtube_auto_uploader.cli.time.sleep", sleep)
-    interruptible_sleep(2.5)
+    requested = 2.5
+    interruptible_sleep(requested)
     assert slept == [1.0, 1.0, 0.5]
+    assert all(piece <= 1 for piece in slept)
+    assert sum(slept) == requested
+    assert clock["now"] == 100.0 + requested
 
 
 def test_sleep_slice_lets_keyboard_interrupt_propagate(monkeypatch):
@@ -342,6 +346,7 @@ def test_ctrl_break_runs_the_keyboard_interrupt_handler():
     proc = subprocess.Popen(
         [
             sys.executable,
+            "-u",
             "-c",
             "\n".join(
                 [
@@ -349,13 +354,16 @@ def test_ctrl_break_runs_the_keyboard_interrupt_handler():
                     "    install_console_interrupt_handler,",
                     "    interruptible_sleep,",
                     ")",
-                    "install_console_interrupt_handler()",
+                    "code = 0",
                     "try:",
+                    "    install_console_interrupt_handler()",
+                    "    print('ready', flush=True)",
                     "    interruptible_sleep(30)",
                     "except KeyboardInterrupt:",
-                    "    print('Stopped.', flush=True)",
-                    "    raise SystemExit(130)",
-                    "raise SystemExit(0)",
+                    "    code = 130",
+                    "finally:",
+                    "    print('finally', flush=True)",
+                    "raise SystemExit(code)",
                 ]
             ),
         ],
@@ -365,14 +373,15 @@ def test_ctrl_break_runs_the_keyboard_interrupt_handler():
         text=True,
     )
     try:
-        time.sleep(0.5)
+        assert proc.stdout.readline() == "ready\n"
         proc.send_signal(signal.CTRL_BREAK_EVENT)
-        output, _ = proc.communicate(timeout=10)
+        output = proc.stdout.read()
+        proc.wait(timeout=10)
     finally:
         if proc.poll() is None:
             proc.kill()
     assert proc.returncode == 130
-    assert "Stopped." in output
+    assert "finally" in output
 
 
 def test_console_interrupt_is_ctrl_c_and_not_kill():
@@ -443,13 +452,20 @@ class FakeProcess:
 
     def send_signal(self, sig):
         self.signals.append(sig)
-        self.returncode = 130
+        # Only the console interrupt is the KeyboardInterrupt path (exit 130).
+        # Any other signal is the hard stop Windows uses for an unhandled break.
+        if sig == console_interrupt():
+            self.returncode = 130
+        else:
+            self.returncode = 0xC000013A
 
     def kill(self):
         self.killed = True
+        self.returncode = 0xC000013A
 
     def terminate(self):
         self.terminated = True
+        self.returncode = 0xC000013A
 
 
 def test_output_streams_until_the_process_exits(tmp_path):
@@ -538,6 +554,21 @@ def test_close_destroys_the_window_when_interrupt_fails():
     assert destroyed == [True]
 
 
+def test_other_signals_and_kill_are_not_a_clean_interrupt():
+    stopped = FakeProcess([], LineStream([]))
+    stopped.send_signal(signal.SIGTERM)
+    assert stopped.returncode == 0xC000013A
+    assert stopped.returncode != 130
+    killed = FakeProcess([], LineStream([]))
+    killed.kill()
+    assert killed.killed is True
+    assert killed.returncode != 130
+    ended = FakeProcess([], LineStream([]))
+    ended.terminate()
+    assert ended.terminated is True
+    assert ended.returncode != 130
+
+
 def test_stop_sends_ctrl_c_and_does_not_kill(tmp_path):
     stream = HeldStream()
     created = []
@@ -553,6 +584,7 @@ def test_stop_sends_ctrl_c_and_does_not_kill(tmp_path):
         assert operator.stop_runner() is True
         process = created[0]
         assert process.signals == [console_interrupt()]
+        assert process.returncode == 130
         assert process.killed is False
         assert process.terminated is False
         assert operator.stop_runner() is False
@@ -574,6 +606,7 @@ def test_stop_does_nothing_for_a_one_shot_command(tmp_path):
         assert operator.current.process.signals == []
         assert operator.interrupt_current() is True
         assert operator.current.process.signals == [console_interrupt()]
+        assert operator.current.process.returncode == 130
         assert operator.current.process.killed is False
     finally:
         stream.queue.put("")
