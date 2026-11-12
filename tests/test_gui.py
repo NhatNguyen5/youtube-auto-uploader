@@ -687,7 +687,8 @@ def test_operator_run_does_not_create_state(tmp_path):
     code = wait_for(run)
     assert code == 1
     text = "".join(run.output_lines)
-    assert "Error (ValueError)" in text
+    assert "State missing" in text
+    assert "no history was reset" not in text
     assert not (tmp_path / "data" / "state.json").exists()
 
 
