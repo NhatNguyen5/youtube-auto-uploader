@@ -343,6 +343,12 @@ def test_run_loop_uses_the_sliced_sleep():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="CTRL_BREAK_EVENT is Windows-only")
 def test_ctrl_break_runs_the_keyboard_interrupt_handler():
+    # The break arrives during this wait. Slices are one second, so the child
+    # should exit well inside the bound. One unsliced sleep of this length
+    # would still be blocked when the bound expires, because SIGBREAK does
+    # not wake time.sleep.
+    long_wait = 30
+    exit_bound = 5
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -358,7 +364,7 @@ def test_ctrl_break_runs_the_keyboard_interrupt_handler():
                     "try:",
                     "    install_console_interrupt_handler()",
                     "    print('ready', flush=True)",
-                    "    interruptible_sleep(30)",
+                    f"    interruptible_sleep({long_wait})",
                     "except KeyboardInterrupt:",
                     "    code = 130",
                     "finally:",
@@ -372,14 +378,28 @@ def test_ctrl_break_runs_the_keyboard_interrupt_handler():
         stderr=subprocess.STDOUT,
         text=True,
     )
+    output = ""
+    elapsed = None
     try:
         assert proc.stdout.readline() == "ready\n"
+        # "ready" is flushed before interruptible_sleep is called. Give the
+        # child time to enter that wait so the break does not land earlier.
+        time.sleep(1)
+        sent = time.monotonic()
         proc.send_signal(signal.CTRL_BREAK_EVENT)
-        output = proc.stdout.read()
-        proc.wait(timeout=10)
+        remaining = exit_bound - (time.monotonic() - sent)
+        try:
+            proc.wait(timeout=max(0.0, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+        elapsed = time.monotonic() - sent
+        if proc.poll() is not None:
+            output = proc.stdout.read()
     finally:
         if proc.poll() is None:
             proc.kill()
+            proc.wait(timeout=5)
+    assert elapsed is not None and elapsed < exit_bound
     assert proc.returncode == 130
     assert "finally" in output
 
@@ -500,6 +520,58 @@ def test_exit_event_is_queued_after_the_command_is_done(monkeypatch):
     run.events.put = spy
     run._pump()
     assert seen == [True]
+
+
+def test_stop_logs_when_the_signal_cannot_be_sent(tmp_path):
+    from youtube_auto_uploader.gui import DesktopWindow
+
+    def window_for(operator):
+        window = DesktopWindow.__new__(DesktopWindow)
+        window.operator = operator
+        window.logged = []
+        window._append_log = window.logged.append
+        return window
+
+    stream = HeldStream()
+
+    class Boom(FakeProcess):
+        def send_signal(self, sig):
+            raise OSError("no console")
+
+    def popen(argv, **kwargs):
+        return Boom(argv, stream, **kwargs)
+
+    operator = Operator(tmp_path / "config.json", popen=popen)
+    window = window_for(operator)
+    try:
+        operator.start("run")
+        window._stop()
+        assert window.logged == ["Could not send stop signal: no console\n"]
+        assert operator.current.stop_error is not None
+        assert operator.current.process.killed is False
+        assert operator.current.process.terminated is False
+        assert operator.current._interrupted is False
+    finally:
+        stream.queue.put("")
+
+    exited = HeldStream()
+
+    def popen_exited(argv, **kwargs):
+        process = FakeProcess(argv, exited, **kwargs)
+        process.returncode = 0
+        return process
+
+    operator = Operator(tmp_path / "config.json", popen=popen_exited)
+    window = window_for(operator)
+    try:
+        operator.start("run")
+        window._stop()
+        assert window.logged == ["Could not send stop signal: process already exited\n"]
+        assert operator.current.process.signals == []
+        assert operator.current.process.killed is False
+        assert operator.current.process.terminated is False
+    finally:
+        exited.queue.put("")
 
 
 def test_failed_signal_is_not_a_kill(tmp_path):
