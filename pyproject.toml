@@ -3,7 +3,7 @@ name = "youtube-auto-uploader"
 version = "0.1.0"
 description = "Discover Drive stories and schedule their videos on YouTube"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.10,<3", "python-dotenv>=1,<2", "google-auth>=2,<3", "google-auth-oauthlib>=1,<2", "requests>=2,<3", "portalocker>=3,<4"]
+dependencies = ["pydantic>=2.10,<3", "python-dotenv>=1,<2", "google-auth>=2,<3", "google-auth-oauthlib>=1,<2", "requests>=2,<3", "portalocker>=3,<4", "tzdata; sys_platform == 'win32'"]
 
 [project.scripts]
 youtube-auto-uploader = "youtube_auto_uploader.cli:main"

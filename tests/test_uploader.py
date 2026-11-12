@@ -1201,11 +1201,12 @@ def test_quota_reset_fallback_around_pacific_dst(monkeypatch):
     import zoneinfo
 
     import youtube_auto_uploader.runner as runner
+    import youtube_auto_uploader.tz as pacific
 
     def explode(key):
         raise zoneinfo.ZoneInfoNotFoundError(key)
 
-    monkeypatch.setattr(runner, "ZoneInfo", explode)
+    monkeypatch.setattr(pacific, "ZoneInfo", explode)
     cases = {
         datetime(2026, 1, 15, 12, tzinfo=UTC): datetime(2026, 1, 16, 8, tzinfo=UTC),
         datetime(2026, 7, 15, 12, tzinfo=UTC): datetime(2026, 7, 16, 7, tzinfo=UTC),
@@ -1221,7 +1222,7 @@ def test_quota_reset_fallback_around_pacific_dst(monkeypatch):
 def test_pacific_fallback_matches_zoneinfo():
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-    from youtube_auto_uploader.runner import _next_pacific_midnight
+    from youtube_auto_uploader.tz import _next_pacific_midnight
 
     try:
         zone = ZoneInfo("America/Los_Angeles")
