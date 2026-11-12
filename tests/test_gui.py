@@ -30,13 +30,13 @@ from youtube_auto_uploader.desktop import (
     cli_argv,
     collect_status,
     console_interrupt,
-    format_status_line,
     log_header,
     read_status,
     status_line,
     status_text,
     subprocess_kwargs,
 )
+from youtube_auto_uploader.status import format_status_line
 from youtube_auto_uploader.storage import Store
 
 
@@ -687,7 +687,7 @@ def test_operator_run_does_not_create_state(tmp_path):
     code = wait_for(run)
     assert code == 1
     text = "".join(run.output_lines)
-    assert "Error (ValueError)" in text
+    assert "State missing" in text
     assert not (tmp_path / "data" / "state.json").exists()
 
 

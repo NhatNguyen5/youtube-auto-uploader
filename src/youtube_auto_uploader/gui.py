@@ -11,9 +11,9 @@ from .desktop import (
     check_running_text,
     collect_status,
     log_header,
-    public_error,
     status_text,
 )
+from .status import public_error
 
 POLL_MS = 100
 CHECKS_PLACEHOLDER = "No validate result yet."

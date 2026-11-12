@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from .drive import ApiError
 from .models import Story
+from .status import ConfigError
 from .storage import upload_log_job_id, upload_log_outcome
 from .tz import pacific_zone
 from .youtube import NeedsReview
@@ -79,7 +80,7 @@ class Runner:
             "youtube_channel_id": settings.youtube_channel_id,
         }
         if self.state.get("binding") and self.state["binding"] != binding:
-            raise ValueError(
+            raise ConfigError(
                 "State belongs to a different root folder or YouTube channel"
             )
         self.state["binding"] = binding
@@ -143,7 +144,7 @@ class Runner:
                     for j in s["jobs"].values()
                 }
                 if any(source["id"] in used for source in sources.values()):
-                    raise ValueError("Source already belongs to another story")
+                    raise ConfigError("Source already belongs to another story")
                 self.state["stories"][sid] = {
                     "name": folder["name"],
                     "snapshot": story.model_dump(mode="json"),

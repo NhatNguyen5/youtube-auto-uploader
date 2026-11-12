@@ -12,6 +12,7 @@ from portalocker.exceptions import LockException
 
 from .drive import ApiError, Drive, checked
 from .models import StatsChannel, require_drive_id
+from .status import ConfigError
 from .storage import atomic_json, parse_json
 from .tz import pacific_zone
 from .youtube import ROOT as YOUTUBE_DATA
@@ -87,7 +88,7 @@ COLUMNS = [
 def parse_timestamp(value):
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("Timestamp requires a timezone")
+        raise ConfigError("Timestamp requires a timezone")
     return parsed
 
 
@@ -100,9 +101,9 @@ def canonical_week(value, moment):
     if not value:
         return week_key(moment)
     if not re.fullmatch(r"\d{4}-W\d{2}", value):
-        raise ValueError("Week must look like 2026-W44")
+        raise ConfigError("Week must look like 2026-W44")
     if not 1 <= int(value[-2:]) <= 53:
-        raise ValueError("Week must look like 2026-W44")
+        raise ConfigError("Week must look like 2026-W44")
     return value
 
 
@@ -217,7 +218,7 @@ def canonical_reach_date(value):
     if re.fullmatch(r"\d{8}", text):
         text = f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-        raise ValueError("Reach report has an invalid date")
+        raise ConfigError("Reach report has an invalid date")
     datetime.fromisoformat(text)
     return text
 
@@ -232,7 +233,7 @@ def normalize_ctr(value):
 def parse_reach_csv(text):
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
-        raise ValueError("Reach report is missing a header")
+        raise ConfigError("Reach report is missing a header")
     fields = {name.strip().lower(): name for name in reader.fieldnames}
     required = (
         "date",
@@ -242,7 +243,7 @@ def parse_reach_csv(text):
     )
     missing = [name for name in required if name not in fields]
     if missing:
-        raise ValueError("Reach report missing columns: " + ", ".join(missing))
+        raise ConfigError("Reach report missing columns: " + ", ".join(missing))
     channel_field = fields.get("channel_id")
     rows = []
     for raw in reader:
@@ -271,7 +272,7 @@ def apply_reach_report(state, report, text):
     day = pacific_date(parse_timestamp(report["startTime"])).isoformat()
     rows = parse_reach_csv(text)
     if any(row["date"] != day for row in rows):
-        raise ValueError("Reach report date does not match its start time")
+        raise ConfigError("Reach report date does not match its start time")
     videos = {}
     for row in rows:
         # channel_reach_basic_a1 has one row per video per day. Last row wins so
@@ -413,7 +414,7 @@ def load_reach(path):
         return {"schema_version": 1, "reach_job_id": "", "days": {}}
     data = parse_json(path.read_text(encoding="utf-8"))
     if data.get("schema_version") != 1 or not isinstance(data.get("days"), dict):
-        raise ValueError("Invalid stats reach history; refusing to overwrite it")
+        raise ConfigError("Invalid stats reach history; refusing to overwrite it")
     return data
 
 
@@ -430,15 +431,15 @@ def analytics_rows(http, channel_id, **params):
         headers = [item["name"] for item in data.get("columnHeaders") or []]
         batch = data.get("rows") or []
         if batch and not headers:
-            raise ValueError("Analytics response missing column headers")
+            raise ConfigError("Analytics response missing column headers")
         for raw in batch:
             if len(raw) != len(headers):
-                raise ValueError("Analytics row does not match column headers")
+                raise ConfigError("Analytics row does not match column headers")
             rows.append(dict(zip(headers, raw)))
         if len(batch) < int(query["maxResults"]):
             return rows
         query["startIndex"] = int(query["startIndex"]) + int(query["maxResults"])
-    raise ValueError("Analytics report exceeded page limit")
+    raise ConfigError("Analytics report exceeded page limit")
 
 
 def video_filter(video_ids):
@@ -462,7 +463,7 @@ def uploaded_videos(http, channel_id):
     ).json()
     items = channel.get("items") or []
     if not items:
-        raise ValueError("YouTube channel was not found for this login")
+        raise ConfigError("YouTube channel was not found for this login")
     playlist = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
     params = {"part": "contentDetails", "playlistId": playlist, "maxResults": 50}
     ids = []
@@ -593,7 +594,7 @@ def paged(http, url, key, params=None):
         if not token:
             return items
         query["pageToken"] = token
-    raise ValueError("Report list exceeded page limit")
+    raise ConfigError("Report list exceeded page limit")
 
 
 def require_download_url(url):
@@ -605,7 +606,7 @@ def require_download_url(url):
         or parsed.username
         or parsed.password
     ):
-        raise ValueError("Unexpected reach report download URL")
+        raise ConfigError("Unexpected reach report download URL")
     return url
 
 
@@ -613,11 +614,11 @@ def download_report(http, url):
     response = checked(http.get(require_download_url(url), timeout=120))
     body = response.content
     if len(body) > MAX_REPORT_BYTES:
-        raise ValueError("Reach report exceeds 50 MiB")
+        raise ConfigError("Reach report exceeds 50 MiB")
     if body.startswith(b"\x1f\x8b"):
         body = gzip.decompress(body)
         if len(body) > MAX_REPORT_BYTES:
-            raise ValueError("Reach report exceeds 50 MiB")
+            raise ConfigError("Reach report exceeds 50 MiB")
     return body.decode("utf-8-sig")
 
 
@@ -808,7 +809,7 @@ def file_name(channel_id, week):
 def export_stats(settings, base, http, *, clock=None, week=None):
     targets = stats_targets(settings)
     if not targets:
-        raise ValueError(
+        raise ConfigError(
             "Set stats_drive_folder_id or stats_channels before export-stats"
         )
     moment = (clock or (lambda: datetime.now(UTC)))()
@@ -819,7 +820,7 @@ def export_stats(settings, base, http, *, clock=None, week=None):
         with portalocker.Lock(str(path) + ".lock", timeout=0):
             return export_locked(targets, path, http, moment, week)
     except LockException as error:
-        raise ValueError("Stats export is already running") from error
+        raise ConfigError("Stats export is already running") from error
 
 
 def authenticated_channel_id(http):
@@ -833,7 +834,7 @@ def authenticated_channel_id(http):
     ids = [item["id"] for item in data.get("items") or []]
     if len(ids) != 1:
         visible = ", ".join(ids) if ids else "none"
-        raise ValueError(
+        raise ConfigError(
             "Reach export needs a login scoped to one YouTube channel. "
             f"This token can see: {visible}. The Reporting API reach job covers "
             "only that authenticated channel."
@@ -843,7 +844,7 @@ def authenticated_channel_id(http):
 
 def require_reach_channel(http, targets):
     if len(targets) != 1:
-        raise ValueError(
+        raise ConfigError(
             "Reach export supports one channel. The Reporting API job covers only "
             "the authenticated channel, so another stats_channels entry would get "
             "blank impressions and click-through rate."
@@ -851,7 +852,7 @@ def require_reach_channel(http, targets):
     authenticated = authenticated_channel_id(http)
     wanted = targets[0].youtube_channel_id
     if wanted != authenticated:
-        raise ValueError(
+        raise ConfigError(
             f"Reach export only includes the authenticated channel {authenticated}, "
             f"not {wanted}."
         )

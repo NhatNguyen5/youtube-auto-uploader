@@ -6,32 +6,66 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
+from pydantic import ValidationError
 
 from . import google_auth
-from .desktop import format_status_line
 from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
 from .stats import export_stats, stats_targets
+from .status import ConfigError, format_status_line, public_error
 from .storage import Store, parse_json
 from .youtube import YouTube
+
+
+def report_remote_stories(drive, root_id, report=print):
+    """Check each story folder. Return how many were invalid.
+
+    One bad folder does not stop the rest. Only ConfigError and pydantic
+    ValidationError are folder failures. Anything else propagates.
+    """
+    invalid = 0
+    for folder in drive.children(root_id):
+        if folder.get("mimeType") != "application/vnd.google-apps.folder":
+            continue
+        folder_id = folder.get("id", "")
+        name = folder.get("name") or ""
+        try:
+            drive.story(folder_id)
+        except (ValidationError, ConfigError) as error:
+            invalid += 1
+            report(f"Invalid story: {folder_id} ({name}): {public_error(error)}")
+        else:
+            report(f"Valid story: {folder_id}")
+    return invalid
 
 
 def export_command(settings, base, week):
     http = None
     persist = None
     try:
+        folder = settings.stats_drive_folder_id
+        if (
+            isinstance(folder, str)
+            and folder.startswith("REPLACE_WITH_")
+            and not settings.stats_channels
+        ):
+            raise ConfigError(
+                "Set stats_drive_folder_id in config.json. "
+                "Replace the REPLACE_WITH_ placeholder with the real id, "
+                "or remove the line."
+            )
         if not stats_targets(settings):
-            raise ValueError(
+            raise ConfigError(
                 "Set stats_drive_folder_id or stats_channels before export-stats"
             )
         message = google_auth.login_message(base)
         if message:
-            raise ValueError(message)
+            raise ConfigError(message)
         http, persist = google_auth.session(base)
         exported = export_stats(settings, base, http, week=week)
-    except (ValueError, ApiError) as error:
-        print(f"Error: {error}")
+    except Exception as error:
+        print(public_error(error))
         return 1
     finally:
         if persist:
@@ -139,10 +173,8 @@ def main():
                 try:
                     YouTube(http).verify_channel(settings.youtube_channel_id)
                     drive = Drive(http)
-                    for folder in drive.children(settings.drive_folder_id):
-                        if folder["mimeType"] == "application/vnd.google-apps.folder":
-                            drive.story(folder["id"])
-                            print(f"Valid story: {folder['id']}")
+                    if report_remote_stories(drive, settings.drive_folder_id):
+                        return 1
                 finally:
                     persist()
                     http.close()
@@ -211,14 +243,8 @@ def main():
         print("Stopped. Saved upload sessions will be reconciled on restart.")
         return 130
     except Exception as error:
-        # Avoid dumping credential-bearing request URLs or remote validation inputs.
-        print(
-            f"Error ({type(error).__name__}). Check configuration, credentials, and saved status; no history was reset."
-        )
-        if isinstance(error, FileNotFoundError):
-            print(
-                "Copy examples/config.example.json to config.json and set your channel ID."
-            )
+        # ValueError text is ours. Other exceptions can carry request URLs.
+        print(public_error(error))
         return 1
 
 

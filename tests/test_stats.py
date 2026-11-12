@@ -217,11 +217,18 @@ def test_reach_summary_weights_ctr_and_counts_missing_days():
 
 
 def test_settings_stats_targets_and_example_config():
-    example = Settings.model_validate(
-        json.loads(Path("examples/config.example.json").read_text(encoding="utf-8"))
+    raw = json.loads(Path("examples/config.example.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="youtube_channel_id"):
+        Settings.model_validate(raw)
+    filled = json.loads(
+        json.dumps(raw)
+        .replace("REPLACE_WITH_YOUTUBE_CHANNEL_ID", "UCchannel")
+        .replace("REPLACE_WITH_UPLOAD_LOG_FOLDER_ID", "")
+        .replace("REPLACE_WITH_STATS_DRIVE_FOLDER_ID", "statsfolder")
     )
+    example = Settings.model_validate(filled)
     assert example.stats_state_path == "data/stats-reach.json"
-    assert stats_targets(example)[0].youtube_channel_id == example.youtube_channel_id
+    assert stats_targets(example)[0].youtube_channel_id == "UCchannel"
     single = Settings(youtube_channel_id="channel", stats_drive_folder_id="folderone")
     assert stats_targets(single)[0].drive_folder_id == "folderone"
     listed = Settings(

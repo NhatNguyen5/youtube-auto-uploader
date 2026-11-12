@@ -11,6 +11,7 @@ from pathlib import Path
 from portalocker.exceptions import AlreadyLocked, LockException
 
 from .models import Settings
+from .status import format_status_line, public_error
 from .storage import Store, parse_json
 
 # Same sentence the window shows when `run` holds the state lock.
@@ -47,19 +48,6 @@ class StatusSnapshot:
         self.message = message
 
 
-def format_status_line(story_id, role, job):
-    """One status line for the CLI and the desktop window."""
-    url = (
-        f"https://www.youtube.com/watch?v={job['video_id']}"
-        if job.get("video_id")
-        else ""
-    )
-    detail = job.get("error", "")
-    if job.get("log_error"):
-        detail = f"{detail} upload-log: {job['log_error']}".strip()
-    return f"{story_id}/{role}: {job['stage']} {url} {detail}"
-
-
 def status_line(story_id, role, job):
     """One line, matching the `status` command."""
     return format_status_line(story_id, role, job)
@@ -81,20 +69,6 @@ def status_text(snapshot):
     if not snapshot.rows:
         return "No stories started yet."
     return "\n".join(snapshot.rows)
-
-
-def public_error(error):
-    if isinstance(error, ValueError):
-        return str(error)
-    message = (
-        f"Error ({type(error).__name__}). "
-        "Check configuration, credentials, and saved status; no history was reset."
-    )
-    if isinstance(error, FileNotFoundError):
-        message += (
-            " Copy examples/config.example.json to config.json and set your channel ID."
-        )
-    return message
 
 
 def read_status(store):
