@@ -4,6 +4,7 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 from .drive import ApiError, checked
+from .status import ConfigError
 
 ROOT = "https://www.googleapis.com/youtube/v3"
 UPLOAD = "https://www.googleapis.com/upload/youtube/v3/videos"
@@ -38,7 +39,7 @@ class YouTube:
             )
         ).json()
         if expected not in {item["id"] for item in data.get("items", [])}:
-            raise ValueError(
+            raise ConfigError(
                 "Authenticated YouTube channel does not match youtube_channel_id"
             )
 
@@ -53,7 +54,7 @@ class YouTube:
         if not any(
             item.get("snippet", {}).get("assignable") for item in data.get("items", [])
         ):
-            raise ValueError("Category is not assignable")
+            raise ConfigError("Category is not assignable")
 
     def start(self, video, source):
         snippet = {

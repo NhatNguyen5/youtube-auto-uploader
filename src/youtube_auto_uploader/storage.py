@@ -18,7 +18,12 @@ def parse_json(text):
             result[key] = value
         return result
 
-    return json.loads(text, object_pairs_hook=pairs)
+    try:
+        return json.loads(text, object_pairs_hook=pairs)
+    except json.JSONDecodeError as error:
+        raise ConfigError(
+            f"Invalid JSON at line {error.lineno} column {error.colno}: {error.msg}"
+        ) from error
 
 
 def atomic_json(path, data):

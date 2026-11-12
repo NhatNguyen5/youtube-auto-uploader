@@ -70,6 +70,30 @@ def test_remote_validate_reports_valid_and_invalid_stories(capsys):
     assert "Valid story: good" in shown
 
 
+def test_bad_json_is_reported_beside_halloween_and_radio(capsys):
+    from youtube_auto_uploader.storage import parse_json
+
+    drive = Mock()
+    drive.children.return_value = [
+        {"id": "h1", "name": "Halloween", "mimeType": FOLDER},
+        {"id": "r1", "name": "Radio", "mimeType": FOLDER},
+        {"id": "bad", "name": "Broken", "mimeType": FOLDER},
+    ]
+
+    def story(folder_id):
+        if folder_id == "bad":
+            parse_json("{")
+        raise ConfigError("Expected one config.json; found 0")
+
+    drive.story.side_effect = story
+    assert report_remote_stories(drive, "root") == 3
+    text = capsys.readouterr().out
+    assert "Invalid story: h1 (Halloween): Expected one config.json; found 0" in text
+    assert "Invalid story: r1 (Radio): Expected one config.json; found 0" in text
+    assert "Invalid story: bad (Broken): Invalid JSON at line 1 column" in text
+    assert "{" not in text
+
+
 def test_remote_validate_does_not_swallow_other_errors(capsys):
     drive = Mock()
     drive.children.return_value = [
@@ -83,6 +107,24 @@ def test_remote_validate_does_not_swallow_other_errors(capsys):
     with pytest.raises(ValueError, match="SECRET"):
         report_remote_stories(drive, "root")
     assert "Invalid story" not in capsys.readouterr().out
+
+
+def test_bad_week_message_is_shown():
+    from datetime import UTC, datetime
+
+    from youtube_auto_uploader.stats import canonical_week
+    from youtube_auto_uploader.status import public_error
+
+    with pytest.raises(ConfigError) as caught:
+        canonical_week("bad", datetime(2026, 10, 17, tzinfo=UTC))
+    assert public_error(caught.value) == "Week must look like 2026-W44"
+
+
+def test_api_error_text_is_shown():
+    from youtube_auto_uploader.status import public_error
+
+    text = public_error(ApiError(403, "forbidden"))
+    assert text == "Google API HTTP 403: forbidden"
 
 
 def test_remote_validate_still_raises_api_errors():

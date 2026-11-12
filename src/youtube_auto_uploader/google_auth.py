@@ -69,7 +69,7 @@ def _path_for(base, role):
         return drive_token_path(base)
     if role == "youtube":
         return youtube_token_path(base)
-        raise ConfigError(f"Unknown OAuth token role: {role}")
+    raise ConfigError(f"Unknown OAuth token role: {role}")
 
 
 def _read_info(path):

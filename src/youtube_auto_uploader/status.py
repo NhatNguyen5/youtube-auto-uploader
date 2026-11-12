@@ -36,13 +36,15 @@ def public_error(error):
     """Text for an exception.
 
     ConfigError is project-written and shown as-is. Pydantic errors show the
-    field and message only, never the rejected input. Every other exception,
-    including library ValueErrors, stays generic because the text can contain
-    a token or request URL.
+    field and message only, never the rejected input. ApiError is only an HTTP
+    status and reason. Every other exception, including library ValueErrors,
+    stays generic because the text can contain a token or request URL.
     """
+    from .drive import ApiError
+
     if isinstance(error, ValidationError):
         return story_reason(error)
-    if isinstance(error, ConfigError):
+    if isinstance(error, (ConfigError, ApiError)):
         return str(error)
     message = (
         f"Error ({type(error).__name__}). "
