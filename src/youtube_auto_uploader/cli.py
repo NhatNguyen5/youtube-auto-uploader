@@ -25,12 +25,9 @@ def export_command(settings, base, week):
             raise ValueError(
                 "Set stats_drive_folder_id or stats_channels before export-stats"
             )
-        missing = google_auth.missing_scopes(base)
-        if missing:
-            raise ValueError(
-                "Saved OAuth token is missing scopes. Run login again to grant: "
-                + ", ".join(missing)
-            )
+        message = google_auth.login_message(base)
+        if message:
+            raise ValueError(message)
         http, persist = google_auth.session(base)
         exported = export_stats(settings, base, http, week=week)
     except (ValueError, ApiError) as error:
@@ -134,6 +131,10 @@ def main():
                     parse_json(args.story.read_text(encoding="utf-8-sig"))
                 )
             if args.remote:
+                message = google_auth.login_message(base)
+                if message:
+                    print(message)
+                    return 1
                 http, persist = google_auth.session(base)
                 try:
                     YouTube(http).verify_channel(settings.youtube_channel_id)
@@ -161,6 +162,10 @@ def main():
                     print("No stories started yet.")
                 return 0
             store.load()  # Fail before connecting if history is missing/corrupt.
+            message = google_auth.login_message(base)
+            if message:
+                print(message)
+                return 1
             http, persist = google_auth.session(base)
             try:
                 youtube = YouTube(http)

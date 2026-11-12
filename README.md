@@ -9,7 +9,7 @@ The initial implementation is available. Automated tests use fake Google service
 1. Install uv and run `uv sync --locked` in this project.
 2. Copy `examples/config.example.json` to `config.json` if it does not exist. Set `youtube_channel_id` to your channel's ID (not its handle). The MidnightUntold Drive root ID is already configured.
 3. Enable Google Drive API, YouTube Data API, YouTube Analytics API, and YouTube Reporting API in your Google Cloud project, configure OAuth consent, and create a **Desktop app** OAuth client. If your consent screen is in testing, add your Google account as a test user. Add the scopes listed in [.env.example](.env.example) to the consent screen. After this list changes, stop the uploader, run `login` again, then start the uploader.
-4. Fill `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`. See [.env.example](.env.example). Login saves refreshable credentials to `GOOGLE_TOKEN_PATH`, defaulting to `secrets/token.json`. Environment variables take precedence over .env. Keep this project in a directory accessible only to your user account.
+4. Fill `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`. See [.env.example](.env.example). `login` opens two consent screens, because Google rejects Drive scopes and YouTube scopes in one request. Step 1 is Google Drive (the account that owns the Drive folders) and saves `GOOGLE_TOKEN_PATH`, defaulting to `secrets/token.json`. Step 2 is YouTube (the account that owns the channel) and saves the sibling file `secrets/token.youtube.json`, unless `GOOGLE_YOUTUBE_TOKEN_PATH` is set. A token from the older single consent is not refreshed; run `login` again. Environment variables take precedence over .env. Keep this project in a directory accessible only to your user account.
 5. Run the commands below. `init-state` is for a new installation only; never delete history to resolve a failure.
 
 ```powershell
@@ -145,7 +145,7 @@ The file is JSONL (one JSON object per line). Another program that can only read
 
 The log write happens only after that local result is saved. If Drive rejects the append, the YouTube video stays saved, `status` prints `upload-log: ...`, and a later pass retries the same line. Transfers still in progress, and missed deadlines that never uploaded, are not logged. `uploaded` includes videos that are already scheduled or public. A processing failure noticed after the line was written remains in local state instead of adding another line.
 
-Creating the file needs the Drive file scope (`drive.file`) in addition to read-only Drive. Run `uv run youtube-auto-uploader login` again after upgrading. An older token keeps uploading; log writes fail until that login, then the pending line is written. No new value is added to `.env`.
+Creating the file needs the Drive file scope (`drive.file`) in addition to read-only Drive. Both are granted on the Drive consent screen, separate from the YouTube screen. Run `uv run youtube-auto-uploader login` again after upgrading. Commands that call Google stop until both tokens exist, and then a pending log line is written. No new value is required in `.env`.
 
 ## Recovery and limitations
 
@@ -170,7 +170,7 @@ uv run youtube-auto-uploader gui
 `--config` still comes before the subcommand: `uv run youtube-auto-uploader --config C:\path\config.json gui`.
 
 - **Refresh** shows the same lines as `status`: one line per story variant (`long` and `short`) with the stage, the YouTube URL when a video id is saved, and any error text. With no stories yet, it says `No stories started yet.` If `run` already holds the state lock, from this window or from a terminal, it shows `Runner is active, status locked`. That check does not wait and does not release the lock.
-- **Login** runs `login` and opens the browser for OAuth.
+- **Login** runs `login` and opens the browser twice: first for Google Drive, then for YouTube.
 - **Validate** runs `validate`. It checks that `config.json` loads. It does not call Google and does not upload. The result stays in the checks box.
 - **Validate remote** runs `validate --remote`. It checks the saved credentials, that the signed-in channel matches `youtube_channel_id`, and that each Drive story config is valid. It lists each valid story id and does not upload.
 - **Start runner** runs continuous `run`. Its output streams into the log. The other command buttons stay off until it stops.
