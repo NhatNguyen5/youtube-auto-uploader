@@ -204,6 +204,85 @@ def test_identical_token_paths_stop_before_the_browser(tmp_path, monkeypatch):
         google_auth.login(tmp_path)
 
 
+def test_cli_prints_value_error_message(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"youtube_channel_id": "UCchannel"}), encoding="utf-8")
+    monkeypatch.setattr(
+        sys, "argv", ["youtube-auto-uploader", "--config", str(config), "status"]
+    )
+    assert main() == 1
+    text = capsys.readouterr().out
+    assert "State missing" in text
+    assert "no history was reset" not in text
+
+
+def test_cli_rejects_placeholder_channel_id(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"youtube_channel_id": "REPLACE_WITH_YOUTUBE_CHANNEL_ID"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["youtube-auto-uploader", "--config", str(config), "validate"]
+    )
+    assert main() == 1
+    text = capsys.readouterr().out
+    assert (
+        "Set youtube_channel_id in config.json (it starts with UC; "
+        "find it at https://www.youtube.com/account_advanced)"
+    ) in text
+    assert "no history was reset" not in text
+
+
+def test_placeholder_ids_name_the_field():
+    from youtube_auto_uploader.models import Settings
+
+    with pytest.raises(ValueError, match="account_advanced"):
+        Settings(youtube_channel_id="")
+    with pytest.raises(ValueError, match="upload_log_folder_id"):
+        Settings(
+            youtube_channel_id="UCchannel",
+            upload_log_folder_id="REPLACE_WITH_UPLOAD_LOG_FOLDER_ID",
+        )
+    with pytest.raises(ValueError, match="stats_drive_folder_id"):
+        Settings(
+            youtube_channel_id="UCchannel",
+            stats_drive_folder_id="REPLACE_WITH_STATS_DRIVE_FOLDER_ID",
+        )
+    with pytest.raises(ValueError, match="drive_folder_id"):
+        Settings(
+            youtube_channel_id="UCchannel",
+            stats_channels=[
+                {
+                    "youtube_channel_id": "UCkids",
+                    "drive_folder_id": "REPLACE_WITH_DRIVE_FOLDER_ID",
+                }
+            ],
+        )
+
+
+def test_cli_hides_non_value_error(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.json"
+    config.write_text("{}", encoding="utf-8")
+
+    def boom(_data):
+        raise RuntimeError("https://oauth.example/token?secret=abc")
+
+    monkeypatch.setattr(
+        "youtube_auto_uploader.cli.Settings.model_validate",
+        boom,
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["youtube-auto-uploader", "--config", str(config), "validate"]
+    )
+    assert main() == 1
+    text = capsys.readouterr().out
+    assert "Error (RuntimeError)" in text
+    assert "no history was reset" in text
+    assert "secret" not in text
+    assert "oauth.example" not in text
+
+
 def test_old_or_missing_tokens_ask_for_login(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
     message = google_auth.login_message(tmp_path)

@@ -17,6 +17,25 @@ def require_drive_id(value, label="Drive folder ID"):
     return value
 
 
+def reject_placeholder(value, field_name):
+    """Reject empty channel ids and unfilled REPLACE_WITH_ example ids."""
+    if not isinstance(value, str):
+        return value
+    if field_name == "youtube_channel_id" and (
+        not value or value.startswith("REPLACE_WITH_")
+    ):
+        raise ValueError(
+            "Set youtube_channel_id in config.json (it starts with UC; "
+            "find it at https://www.youtube.com/account_advanced)"
+        )
+    if value.startswith("REPLACE_WITH_"):
+        raise ValueError(
+            f"Set {field_name} in config.json. "
+            "Replace the REPLACE_WITH_ placeholder with the real id."
+        )
+    return value
+
+
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -29,7 +48,9 @@ class StatsChannel(Model):
     @field_validator("youtube_channel_id", "drive_folder_id")
     @classmethod
     def ids(cls, value, info):
-        return require_drive_id(value, info.field_name)
+        return require_drive_id(
+            reject_placeholder(value, info.field_name), info.field_name
+        )
 
     @field_validator("label")
     @classmethod
@@ -54,12 +75,27 @@ class Settings(Model):
     stats_state_path: str = "data/stats-reach.json"
     stats_channels: list[StatsChannel] = Field(default_factory=list)
 
+    @field_validator("youtube_channel_id")
+    @classmethod
+    def channel(cls, value):
+        return reject_placeholder(value, "youtube_channel_id")
+
+    @field_validator("drive_folder_id", "upload_log_folder_id")
+    @classmethod
+    def folder_ids(cls, value, info):
+        if info.field_name == "upload_log_folder_id" and not value:
+            return value
+        return reject_placeholder(value, info.field_name)
+
     @field_validator("stats_drive_folder_id")
     @classmethod
     def stats_folder(cls, value):
         if value is None:
             return None
-        return require_drive_id(value, "stats Drive folder ID")
+        return require_drive_id(
+            reject_placeholder(value, "stats_drive_folder_id"),
+            "stats Drive folder ID",
+        )
 
     @field_validator("stats_state_path")
     @classmethod

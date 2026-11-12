@@ -8,11 +8,11 @@ from pathlib import Path
 import requests
 
 from . import google_auth
-from .desktop import format_status_line
 from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
 from .stats import export_stats, stats_targets
+from .status import format_status_line, public_error
 from .storage import Store, parse_json
 from .youtube import YouTube
 
@@ -211,14 +211,8 @@ def main():
         print("Stopped. Saved upload sessions will be reconciled on restart.")
         return 130
     except Exception as error:
-        # Avoid dumping credential-bearing request URLs or remote validation inputs.
-        print(
-            f"Error ({type(error).__name__}). Check configuration, credentials, and saved status; no history was reset."
-        )
-        if isinstance(error, FileNotFoundError):
-            print(
-                "Copy examples/config.example.json to config.json and set your channel ID."
-            )
+        # ValueError text is ours. Other exceptions can carry request URLs.
+        print(public_error(error))
         return 1
 
 
