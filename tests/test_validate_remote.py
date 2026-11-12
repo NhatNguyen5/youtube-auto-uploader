@@ -71,27 +71,75 @@ def test_remote_validate_reports_valid_and_invalid_stories(capsys):
 
 
 def test_bad_json_is_reported_beside_halloween_and_radio(capsys):
-    from youtube_auto_uploader.storage import parse_json
+    from pathlib import Path
 
-    drive = Mock()
-    drive.children.return_value = [
-        {"id": "h1", "name": "Halloween", "mimeType": FOLDER},
-        {"id": "r1", "name": "Radio", "mimeType": FOLDER},
-        {"id": "bad", "name": "Broken", "mimeType": FOLDER},
-    ]
+    from youtube_auto_uploader.drive import Drive
 
-    def story(folder_id):
-        if folder_id == "bad":
-            parse_json("{")
-        raise ConfigError("Expected one config.json; found 0")
+    story = Path("examples/story-config.example.json").read_bytes()
+    secret_doc = b"{not-json SECRETDOC"
 
-    drive.story.side_effect = story
-    assert report_remote_stories(drive, "root") == 3
+    def files_for(folder_id):
+        return [
+            {
+                "id": f"{folder_id}-config",
+                "name": "config.json",
+                "mimeType": "application/json",
+            },
+            {
+                "id": f"{folder_id}-long",
+                "name": "long.mp4",
+                "mimeType": "video/mp4",
+                "size": "3",
+                "capabilities": {"canDownload": True},
+            },
+            {
+                "id": f"{folder_id}-short",
+                "name": "short.mp4",
+                "mimeType": "video/mp4",
+                "size": "3",
+                "capabilities": {"canDownload": True},
+            },
+        ]
+
+    media = {
+        "h1-config": story,
+        "r1-config": story,
+        "bad-config": secret_doc,
+    }
+
+    def get(url, params=None, **kwargs):
+        params = params or {}
+        result = Mock(status_code=200, headers={})
+        if params.get("alt") == "media":
+            body = media[url.rstrip("/").rsplit("/", 1)[-1]]
+            result.iter_content = lambda _size: [body]
+            result.content = body
+            result.__enter__ = Mock(return_value=result)
+            result.__exit__ = Mock(return_value=False)
+            return result
+        query = params.get("q", "")
+        if "'root'" in query:
+            files = [
+                {"id": "h1", "name": "Halloween", "mimeType": FOLDER},
+                {"id": "r1", "name": "Radio", "mimeType": FOLDER},
+                {"id": "bad", "name": "Broken", "mimeType": FOLDER},
+            ]
+        else:
+            folder_id = next(
+                item for item in ("h1", "r1", "bad") if f"'{item}'" in query
+            )
+            files = files_for(folder_id)
+        result.json.return_value = {"files": files}
+        return result
+
+    http = Mock()
+    http.get.side_effect = get
+    assert report_remote_stories(Drive(http), "root") == 1
     text = capsys.readouterr().out
-    assert "Invalid story: h1 (Halloween): Expected one config.json; found 0" in text
-    assert "Invalid story: r1 (Radio): Expected one config.json; found 0" in text
+    assert "Valid story: h1" in text
+    assert "Valid story: r1" in text
     assert "Invalid story: bad (Broken): Invalid JSON at line 1 column" in text
-    assert "{" not in text
+    assert "SECRETDOC" not in text
 
 
 def test_remote_validate_does_not_swallow_other_errors(capsys):
@@ -120,11 +168,15 @@ def test_bad_week_message_is_shown():
     assert public_error(caught.value) == "Week must look like 2026-W44"
 
 
-def test_api_error_text_is_shown():
+def test_api_error_text_omits_request_url():
     from youtube_auto_uploader.status import public_error
 
-    text = public_error(ApiError(403, "forbidden"))
+    error = ApiError(403, "forbidden")
+    error.url = "https://www.googleapis.com/youtube/v3/videos?access_token=SECRET"
+    text = public_error(error)
     assert text == "Google API HTTP 403: forbidden"
+    assert "SECRET" not in text
+    assert "access_token" not in text
 
 
 def test_remote_validate_still_raises_api_errors():

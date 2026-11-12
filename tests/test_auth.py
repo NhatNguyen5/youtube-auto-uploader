@@ -271,6 +271,79 @@ def test_placeholder_ids_name_the_field():
         )
 
 
+def test_unknown_token_role_raises(tmp_path):
+    with pytest.raises(google_auth.ConfigError, match="Unknown OAuth token role"):
+        google_auth._path_for(tmp_path, "other")
+
+
+def test_cli_shows_channel_mismatch(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({"youtube_channel_id": "UCexpected"}), encoding="utf-8"
+    )
+    _write_split_tokens(tmp_path)
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "token.json")
+    http = Mock()
+
+    def get(url, **kwargs):
+        result = Mock(status_code=200, headers={})
+        result.json.return_value = {"items": [{"id": "UCother"}]}
+        return result
+
+    http.get.side_effect = get
+    http.close = Mock()
+    monkeypatch.setattr(google_auth, "session", lambda base: (http, lambda: None))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "youtube-auto-uploader",
+            "--config",
+            str(config),
+            "validate",
+            "--remote",
+        ],
+    )
+    assert main() == 1
+    text = capsys.readouterr().out
+    assert "Authenticated YouTube channel does not match youtube_channel_id" in text
+    assert "Error (ValueError)" not in text
+
+
+def test_cli_shows_bad_week(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "youtube_channel_id": "UCchannel",
+                "stats_drive_folder_id": "statsfolder",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_split_tokens(tmp_path)
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "token.json")
+    http = Mock()
+    http.close = Mock()
+    monkeypatch.setattr(google_auth, "session", lambda base: (http, lambda: None))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "youtube-auto-uploader",
+            "--config",
+            str(config),
+            "export-stats",
+            "--week",
+            "bad",
+        ],
+    )
+    assert main() == 1
+    text = capsys.readouterr().out
+    assert "Week must look like 2026-W44" in text
+    assert "Error (ValueError)" not in text
+
+
 def test_unfilled_stats_folder_does_not_block_validate(tmp_path, monkeypatch, capsys):
     config = tmp_path / "config.json"
     config.write_text(
