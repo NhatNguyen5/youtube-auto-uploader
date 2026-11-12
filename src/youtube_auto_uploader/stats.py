@@ -6,7 +6,6 @@ import math
 import re
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
 
 import portalocker
 from portalocker.exceptions import LockException
@@ -14,10 +13,10 @@ from portalocker.exceptions import LockException
 from .drive import ApiError, Drive, checked
 from .models import StatsChannel, require_drive_id
 from .storage import atomic_json, parse_json
+from .tz import pacific_zone
 from .youtube import ROOT as YOUTUBE_DATA
 from .youtube import YouTube
 
-PACIFIC = ZoneInfo("America/Los_Angeles")
 ANALYTICS = "https://youtubeanalytics.googleapis.com/v2/reports"
 REPORTING = "https://youtubereporting.googleapis.com/v1"
 REACH_REPORT = "channel_reach_basic_a1"
@@ -93,7 +92,7 @@ def parse_timestamp(value):
 
 
 def week_key(moment):
-    iso = moment.astimezone(PACIFIC).isocalendar()
+    iso = moment.astimezone(pacific_zone()).isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
 
 
@@ -117,14 +116,15 @@ def publication_time(video):
 
 
 def pacific_date(moment):
-    return moment.astimezone(PACIFIC).date()
+    return moment.astimezone(pacific_zone()).date()
 
 
 def day_bounds(day):
     # Local midnights, not 24-hour steps, so a daylight-saving day is 23 or 25 hours.
+    zone = pacific_zone()
     nxt = day.fromordinal(day.toordinal() + 1)
-    start = datetime(day.year, day.month, day.day, tzinfo=PACIFIC)
-    end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=PACIFIC)
+    start = datetime(day.year, day.month, day.day, tzinfo=zone)
+    end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=zone)
     return start, end
 
 
@@ -135,8 +135,9 @@ def absolute_seconds(start, end):
 
 
 def window_days(published_at):
-    start = published_at.astimezone(PACIFIC)
-    end = (published_at.astimezone(UTC) + timedelta(hours=72)).astimezone(PACIFIC)
+    zone = pacific_zone()
+    start = published_at.astimezone(zone)
+    end = (published_at.astimezone(UTC) + timedelta(hours=72)).astimezone(zone)
     day = start.date()
     last = end.date()
     slots = []

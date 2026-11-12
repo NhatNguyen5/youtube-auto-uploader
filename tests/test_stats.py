@@ -15,7 +15,6 @@ from youtube_auto_uploader.cli import main
 from youtube_auto_uploader.drive import STATS_EXPORTER, ApiError, Drive
 from youtube_auto_uploader.models import Settings, StatsChannel
 from youtube_auto_uploader.stats import (
-    PACIFIC,
     aggregate_window,
     analytics_rows,
     apply_reach_report,
@@ -31,8 +30,10 @@ from youtube_auto_uploader.stats import (
     week_key,
     window_days,
 )
+from youtube_auto_uploader.tz import pacific_zone
 
 MOMENT = datetime(2026, 6, 10, 18, tzinfo=UTC)
+PACIFIC = pacific_zone()
 
 
 def json_response(data, content=None):
