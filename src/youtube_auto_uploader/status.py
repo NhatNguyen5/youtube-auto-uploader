@@ -1,5 +1,7 @@
 """Messages safe to show in the CLI and the desktop window."""
 
+from pydantic import ValidationError
+
 
 def format_status_line(story_id, role, job):
     """One status line for the CLI and the desktop window."""
@@ -12,6 +14,18 @@ def format_status_line(story_id, role, job):
     if job.get("log_error"):
         detail = f"{detail} upload-log: {job['log_error']}".strip()
     return f"{story_id}/{role}: {job['stage']} {url} {detail}"
+
+
+def story_reason(error):
+    """Short story-config failure. Field location and message only, no input values."""
+    if isinstance(error, ValidationError):
+        parts = []
+        for item in error.errors():
+            loc = ".".join(str(part) for part in item.get("loc") or ())
+            msg = item.get("msg") or "invalid"
+            parts.append(f"{loc}: {msg}" if loc else msg)
+        return "; ".join(parts) or "invalid"
+    return str(error)
 
 
 def public_error(error):

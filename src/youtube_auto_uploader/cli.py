@@ -6,15 +6,38 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
+from pydantic import ValidationError
 
 from . import google_auth
 from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
 from .stats import export_stats, stats_targets
-from .status import format_status_line, public_error
+from .status import format_status_line, public_error, story_reason
 from .storage import Store, parse_json
 from .youtube import YouTube
+
+
+def report_remote_stories(drive, root_id, report=print):
+    """Check each story folder. Return how many were invalid.
+
+    One bad folder does not stop the rest. The reason is the ValueError text,
+    or for pydantic only the field location and message.
+    """
+    invalid = 0
+    for folder in drive.children(root_id):
+        if folder.get("mimeType") != "application/vnd.google-apps.folder":
+            continue
+        folder_id = folder.get("id", "")
+        name = folder.get("name") or ""
+        try:
+            drive.story(folder_id)
+        except (ValidationError, ValueError) as error:
+            invalid += 1
+            report(f"Invalid story: {folder_id} ({name}): {story_reason(error)}")
+        else:
+            report(f"Valid story: {folder_id}")
+    return invalid
 
 
 def export_command(settings, base, week):
@@ -139,10 +162,8 @@ def main():
                 try:
                     YouTube(http).verify_channel(settings.youtube_channel_id)
                     drive = Drive(http)
-                    for folder in drive.children(settings.drive_folder_id):
-                        if folder["mimeType"] == "application/vnd.google-apps.folder":
-                            drive.story(folder["id"])
-                            print(f"Valid story: {folder['id']}")
+                    if report_remote_stories(drive, settings.drive_folder_id):
+                        return 1
                 finally:
                     persist()
                     http.close()
