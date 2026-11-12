@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 from .models import Story, require_drive_id
+from .status import ConfigError
 from .storage import parse_json
 
 ROOT = "https://www.googleapis.com/drive/v3/files"
@@ -101,7 +102,7 @@ class Drive:
         def unique(name):
             matches = [f for f in files if f["name"] == name]
             if len(matches) != 1:
-                raise ValueError(f"Expected one {name}; found {len(matches)}")
+                raise ConfigError(f"Expected one {name}; found {len(matches)}")
             return matches[0]
 
         config = unique("config.json")
@@ -117,14 +118,14 @@ class Drive:
             for chunk in response.iter_content(65536):
                 content.extend(chunk)
                 if len(content) > 1024 * 1024:
-                    raise ValueError("Story config exceeds 1 MiB")
+                    raise ConfigError("Story config exceeds 1 MiB")
         story = Story.model_validate(parse_json(content.decode("utf-8-sig")))
         sources = {role: unique(video.filename) for role, video in story.videos.items()}
         for source in sources.values():
             if not is_video(source) or int(source.get("size", 0)) <= 0:
-                raise ValueError("Source must be a nonempty video file")
+                raise ConfigError("Source must be a nonempty video file")
             if not source.get("capabilities", {}).get("canDownload", False):
-                raise ValueError("Source does not permit downloads")
+                raise ConfigError("Source does not permit downloads")
         return story, sources
 
     def download(self, source, target):

@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .status import ConfigError
+
 DRIVE_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
 
 
@@ -13,7 +15,7 @@ def require_drive_id(value, label="Drive folder ID"):
         or not value
         or any(character not in DRIVE_ID_ALPHABET for character in value)
     ):
-        raise ValueError(f"Invalid {label}")
+        raise ConfigError(f"Invalid {label}")
     return value
 
 
@@ -24,12 +26,18 @@ def reject_placeholder(value, field_name):
     if field_name == "youtube_channel_id" and (
         not value or value.startswith("REPLACE_WITH_")
     ):
-        raise ValueError(
+        raise ConfigError(
             "Set youtube_channel_id in config.json (it starts with UC; "
             "find it at https://www.youtube.com/account_advanced)"
         )
+    if field_name == "upload_log_folder_id" and value.startswith("REPLACE_WITH_"):
+        raise ConfigError(
+            "Set upload_log_folder_id in config.json. "
+            "Replace the REPLACE_WITH_ placeholder with the real id, "
+            "or set it to an empty string to turn the log off."
+        )
     if value.startswith("REPLACE_WITH_"):
-        raise ValueError(
+        raise ConfigError(
             f"Set {field_name} in config.json. "
             "Replace the REPLACE_WITH_ placeholder with the real id."
         )
@@ -90,19 +98,19 @@ class Settings(Model):
     @field_validator("stats_drive_folder_id")
     @classmethod
     def stats_folder(cls, value):
-        if value is None:
-            return None
-        return require_drive_id(
-            reject_placeholder(value, "stats_drive_folder_id"),
-            "stats Drive folder ID",
-        )
+        # A placeholder is left for export-stats. run and validate ignore it.
+        if value is None or (
+            isinstance(value, str) and value.startswith("REPLACE_WITH_")
+        ):
+            return value
+        return require_drive_id(value, "stats Drive folder ID")
 
     @field_validator("stats_state_path")
     @classmethod
     def stats_path(cls, value):
         path = Path(value)
         if not value or path.is_absolute() or ".." in path.parts:
-            raise ValueError("stats_state_path must stay under the config directory")
+            raise ConfigError("stats_state_path must stay under the config directory")
         return value
 
 

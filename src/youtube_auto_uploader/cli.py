@@ -13,7 +13,7 @@ from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
 from .stats import export_stats, stats_targets
-from .status import format_status_line, public_error, story_reason
+from .status import ConfigError, format_status_line, public_error
 from .storage import Store, parse_json
 from .youtube import YouTube
 
@@ -21,8 +21,8 @@ from .youtube import YouTube
 def report_remote_stories(drive, root_id, report=print):
     """Check each story folder. Return how many were invalid.
 
-    One bad folder does not stop the rest. The reason is the ValueError text,
-    or for pydantic only the field location and message.
+    One bad folder does not stop the rest. Only ConfigError and pydantic
+    ValidationError are folder failures. Anything else propagates.
     """
     invalid = 0
     for folder in drive.children(root_id):
@@ -32,9 +32,9 @@ def report_remote_stories(drive, root_id, report=print):
         name = folder.get("name") or ""
         try:
             drive.story(folder_id)
-        except (ValidationError, ValueError) as error:
+        except (ValidationError, ConfigError) as error:
             invalid += 1
-            report(f"Invalid story: {folder_id} ({name}): {story_reason(error)}")
+            report(f"Invalid story: {folder_id} ({name}): {public_error(error)}")
         else:
             report(f"Valid story: {folder_id}")
     return invalid
@@ -44,17 +44,28 @@ def export_command(settings, base, week):
     http = None
     persist = None
     try:
+        folder = settings.stats_drive_folder_id
+        if (
+            isinstance(folder, str)
+            and folder.startswith("REPLACE_WITH_")
+            and not settings.stats_channels
+        ):
+            raise ConfigError(
+                "Set stats_drive_folder_id in config.json. "
+                "Replace the REPLACE_WITH_ placeholder with the real id, "
+                "or remove the line."
+            )
         if not stats_targets(settings):
-            raise ValueError(
+            raise ConfigError(
                 "Set stats_drive_folder_id or stats_channels before export-stats"
             )
         message = google_auth.login_message(base)
         if message:
-            raise ValueError(message)
+            raise ConfigError(message)
         http, persist = google_auth.session(base)
         exported = export_stats(settings, base, http, week=week)
-    except (ValueError, ApiError) as error:
-        print(f"Error: {error}")
+    except Exception as error:
+        print(public_error(error))
         return 1
     finally:
         if persist:

@@ -204,16 +204,26 @@ def test_identical_token_paths_stop_before_the_browser(tmp_path, monkeypatch):
         google_auth.login(tmp_path)
 
 
-def test_cli_prints_value_error_message(tmp_path, monkeypatch, capsys):
+def test_cli_hides_token_in_invalid_url(tmp_path, monkeypatch, capsys):
+    from requests.exceptions import InvalidURL
+
     config = tmp_path / "config.json"
     config.write_text(json.dumps({"youtube_channel_id": "UCchannel"}), encoding="utf-8")
+
+    def boom(_data):
+        raise InvalidURL(
+            "Invalid URL 'https://www.googleapis.com/drive/v3/files?access_token=SECRET'"
+        )
+
+    monkeypatch.setattr("youtube_auto_uploader.cli.Settings.model_validate", boom)
     monkeypatch.setattr(
-        sys, "argv", ["youtube-auto-uploader", "--config", str(config), "status"]
+        sys, "argv", ["youtube-auto-uploader", "--config", str(config), "validate"]
     )
     assert main() == 1
     text = capsys.readouterr().out
-    assert "State missing" in text
-    assert "no history was reset" not in text
+    assert "Error (InvalidURL)" in text
+    assert "SECRET" not in text
+    assert "access_token" not in text
 
 
 def test_cli_rejects_placeholder_channel_id(tmp_path, monkeypatch, capsys):
@@ -239,16 +249,16 @@ def test_placeholder_ids_name_the_field():
 
     with pytest.raises(ValueError, match="account_advanced"):
         Settings(youtube_channel_id="")
-    with pytest.raises(ValueError, match="upload_log_folder_id"):
+    with pytest.raises(ValueError, match="empty string to turn the log off"):
         Settings(
             youtube_channel_id="UCchannel",
             upload_log_folder_id="REPLACE_WITH_UPLOAD_LOG_FOLDER_ID",
         )
-    with pytest.raises(ValueError, match="stats_drive_folder_id"):
-        Settings(
-            youtube_channel_id="UCchannel",
-            stats_drive_folder_id="REPLACE_WITH_STATS_DRIVE_FOLDER_ID",
-        )
+    settings = Settings(
+        youtube_channel_id="UCchannel",
+        stats_drive_folder_id="REPLACE_WITH_STATS_DRIVE_FOLDER_ID",
+    )
+    assert settings.stats_drive_folder_id.startswith("REPLACE_WITH_")
     with pytest.raises(ValueError, match="drive_folder_id"):
         Settings(
             youtube_channel_id="UCchannel",
@@ -259,6 +269,33 @@ def test_placeholder_ids_name_the_field():
                 }
             ],
         )
+
+
+def test_unfilled_stats_folder_does_not_block_validate(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "youtube_channel_id": "UCchannel",
+                "stats_drive_folder_id": "REPLACE_WITH_STATS_DRIVE_FOLDER_ID",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["youtube-auto-uploader", "--config", str(config), "validate"]
+    )
+    assert main() == 0
+    assert "Validation passed" in capsys.readouterr().out
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["youtube-auto-uploader", "--config", str(config), "export-stats"],
+    )
+    assert main() == 1
+    text = capsys.readouterr().out
+    assert "or remove the line" in text
+    assert "stats_drive_folder_id" in text
 
 
 def test_cli_hides_non_value_error(tmp_path, monkeypatch, capsys):

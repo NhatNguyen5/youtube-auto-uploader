@@ -3,6 +3,10 @@
 from pydantic import ValidationError
 
 
+class ConfigError(ValueError):
+    """A message this project wrote. Safe to show; no tokens, secrets, or request URLs."""
+
+
 def format_status_line(story_id, role, job):
     """One status line for the CLI and the desktop window."""
     url = (
@@ -29,13 +33,16 @@ def story_reason(error):
 
 
 def public_error(error):
-    """Text for an exception. Only ValueError text is shown as-is.
+    """Text for an exception.
 
-    Other exceptions can carry credential-bearing request URLs, so those stay
-    generic. ValueError messages raised by this project must not include a
-    token, secret, or full request URL.
+    ConfigError is project-written and shown as-is. Pydantic errors show the
+    field and message only, never the rejected input. Every other exception,
+    including library ValueErrors, stays generic because the text can contain
+    a token or request URL.
     """
-    if isinstance(error, ValueError):
+    if isinstance(error, ValidationError):
+        return story_reason(error)
+    if isinstance(error, ConfigError):
         return str(error)
     message = (
         f"Error ({type(error).__name__}). "

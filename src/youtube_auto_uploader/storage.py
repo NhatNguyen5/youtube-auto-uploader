@@ -6,13 +6,15 @@ from pathlib import Path
 
 import portalocker
 
+from .status import ConfigError
+
 
 def parse_json(text):
     def pairs(items):
         result = {}
         for key, value in items:
             if key in result:
-                raise ValueError(f"duplicate JSON key: {key}")
+                raise ConfigError(f"duplicate JSON key: {key}")
             result[key] = value
         return result
 
@@ -44,7 +46,7 @@ class Store:
 
     def initialize(self):
         if self.path.exists():
-            raise ValueError("State already exists; refusing to overwrite history")
+            raise ConfigError("State already exists; refusing to overwrite history")
         atomic_json(
             self.path,
             {"schema_version": 1, "installation_id": str(uuid.uuid4()), "stories": {}},
@@ -52,7 +54,7 @@ class Store:
 
     def load(self):
         if not self.path.exists():
-            raise ValueError(
+            raise ConfigError(
                 "State missing. Use init-state only for a new installation; otherwise restore history"
             )
         data = parse_json(self.path.read_text(encoding="utf-8"))
@@ -61,7 +63,7 @@ class Store:
             or not data.get("installation_id")
             or not isinstance(data.get("stories"), dict)
         ):
-            raise ValueError("Invalid state; restore and reconcile history")
+            raise ConfigError("Invalid state; restore and reconcile history")
         for story in data["stories"].values():
             validate_story_state(story)
         return data
@@ -75,10 +77,10 @@ def validate_story_state(story):
 
     Story.model_validate(story["snapshot"])
     if set(story["jobs"]) != {"long", "short"}:
-        raise ValueError("Incomplete story state")
+        raise ConfigError("Incomplete story state")
     for job in story["jobs"].values():
         if not isinstance(job, dict) or "stage" not in job or "source" not in job:
-            raise ValueError("Invalid job state")
+            raise ConfigError("Invalid job state")
         if job["stage"] not in {
             "pending",
             "downloading",
@@ -91,25 +93,25 @@ def validate_story_state(story):
             "failed",
             "needs_review",
         }:
-            raise ValueError("Unknown job stage")
+            raise ConfigError("Unknown job stage")
         if job["stage"] == "uploading" and not job.get("session"):
-            raise ValueError("Uploading job missing session")
+            raise ConfigError("Uploading job missing session")
         if job["stage"] in {
             "uploaded",
             "scheduling",
             "scheduled",
             "published",
         } and not job.get("video_id"):
-            raise ValueError("Uploaded job missing video ID")
+            raise ConfigError("Uploaded job missing video ID")
         if not job["source"].get("id") or int(job["source"].get("size", 0)) <= 0:
-            raise ValueError("Invalid source identity")
+            raise ConfigError("Invalid source identity")
         if not isinstance(job.get("attempts"), int) or job["attempts"] < 0:
-            raise ValueError("Invalid attempt count")
+            raise ConfigError("Invalid attempt count")
         if "log_recorded" in job and not isinstance(job["log_recorded"], bool):
-            raise ValueError("Invalid upload log flag")
+            raise ConfigError("Invalid upload log flag")
         failures = job.get("consecutive_failures", 0)
         if not isinstance(failures, int) or failures < 0:
-            raise ValueError("Invalid consecutive failure count")
+            raise ConfigError("Invalid consecutive failure count")
 
 
 def upload_log_job_id(channel_id, story_id, role):

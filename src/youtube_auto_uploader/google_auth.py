@@ -8,6 +8,7 @@ from google.auth.transport.requests import AuthorizedSession
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
+from .status import ConfigError
 from .storage import atomic_json
 
 # Google rejects Drive scopes and YouTube scopes in one consent request.
@@ -68,7 +69,7 @@ def _path_for(base, role):
         return drive_token_path(base)
     if role == "youtube":
         return youtube_token_path(base)
-    raise ValueError(f"Unknown OAuth token role: {role}")
+        raise ConfigError(f"Unknown OAuth token role: {role}")
 
 
 def _read_info(path):
@@ -174,11 +175,11 @@ def login(base):
     }
     missing = [key for key, value in values.items() if not value]
     if missing:
-        raise ValueError("Fill in .env: " + ", ".join(missing))
+        raise ConfigError("Fill in .env: " + ", ".join(missing))
     drive_path = drive_token_path(base).resolve()
     youtube_path = youtube_token_path(base).resolve()
     if drive_path == youtube_path:
-        raise ValueError(
+        raise ConfigError(
             "GOOGLE_YOUTUBE_TOKEN_PATH is the same file as GOOGLE_TOKEN_PATH. "
             "Choose a different file for the YouTube token."
         )
@@ -204,7 +205,7 @@ def login(base):
                 "Tick every box on the consent screen and run login again."
             )
             print(message)
-            raise ValueError(message)
+            raise ConfigError(message)
         atomic_json(_path_for(base, role), json.loads(credentials.to_json()))
 
 
@@ -213,7 +214,7 @@ def _credentials(info, fallback):
     try:
         return Credentials.from_authorized_user_info(info, scopes)
     except ValueError as error:
-        raise ValueError(
+        raise ConfigError(
             "Saved OAuth tokens are missing or out of date. Run login again."
         ) from error
 
@@ -271,7 +272,7 @@ class RoutedSession:
 def session(base):
     message = login_message(base)
     if message:
-        raise ValueError(message)
+        raise ConfigError(message)
     opened = []
     for role, _title, scopes, _account in LOGIN_STEPS:
         path = _path_for(base, role)

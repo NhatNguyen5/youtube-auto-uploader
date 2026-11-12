@@ -1,12 +1,13 @@
 from unittest.mock import Mock
 
+import pytest
 from pydantic import ValidationError
 
 from youtube_auto_uploader.cli import report_remote_stories
 from youtube_auto_uploader.desktop import check_result_text
 from youtube_auto_uploader.drive import ApiError
 from youtube_auto_uploader.models import Story
-from youtube_auto_uploader.status import story_reason
+from youtube_auto_uploader.status import ConfigError, story_reason
 
 FOLDER = "application/vnd.google-apps.folder"
 
@@ -43,7 +44,7 @@ def test_remote_validate_reports_valid_and_invalid_stories(capsys):
 
     def story(folder_id):
         if folder_id == "missing":
-            raise ValueError("Expected one config.json; found 0")
+            raise ConfigError("Expected one config.json; found 0")
         if folder_id == "badjson":
             Story.model_validate(
                 {"schema_version": 1, "enabled": "SECRETTOKEN", "videos": {}}
@@ -67,6 +68,21 @@ def test_remote_validate_reports_valid_and_invalid_stories(capsys):
     assert shown.startswith("Validate remote: failed (exit 1)\n")
     assert "Invalid story: missing (Missing Config):" in shown
     assert "Valid story: good" in shown
+
+
+def test_remote_validate_does_not_swallow_other_errors(capsys):
+    drive = Mock()
+    drive.children.return_value = [
+        {"id": "leaky", "name": "Leaky", "mimeType": FOLDER},
+    ]
+
+    def story(_folder_id):
+        raise ValueError("https://www.googleapis.com/drive?access_token=SECRET")
+
+    drive.story.side_effect = story
+    with pytest.raises(ValueError, match="SECRET"):
+        report_remote_stories(drive, "root")
+    assert "Invalid story" not in capsys.readouterr().out
 
 
 def test_remote_validate_still_raises_api_errors():
