@@ -47,14 +47,22 @@ class StatusSnapshot:
         self.message = message
 
 
-def status_line(story_id, role, job):
-    """One line, matching the `status` command."""
+def format_status_line(story_id, role, job):
+    """One status line for the CLI and the desktop window."""
     url = (
         f"https://www.youtube.com/watch?v={job['video_id']}"
         if job.get("video_id")
         else ""
     )
-    return f"{story_id}/{role}: {job['stage']} {url} {job.get('error', '')}"
+    detail = job.get("error", "")
+    if job.get("log_error"):
+        detail = f"{detail} upload-log: {job['log_error']}".strip()
+    return f"{story_id}/{role}: {job['stage']} {url} {detail}"
+
+
+def status_line(story_id, role, job):
+    """One line, matching the `status` command."""
+    return format_status_line(story_id, role, job)
 
 
 def status_rows(state):

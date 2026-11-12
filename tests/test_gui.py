@@ -30,8 +30,10 @@ from youtube_auto_uploader.desktop import (
     cli_argv,
     collect_status,
     console_interrupt,
+    format_status_line,
     log_header,
     read_status,
+    status_line,
     status_text,
     subprocess_kwargs,
 )
@@ -107,6 +109,29 @@ def test_status_lines_match_the_status_command(tmp_path):
     assert status_text(snapshot) == "\n".join(snapshot.rows)
     with store.lock():
         pass
+
+
+def test_gui_status_includes_upload_log_error(tmp_path):
+    store = saved_state(tmp_path)
+    state = store.load()
+    state["stories"]["alpha"]["jobs"]["long"]["log_error"] = "Network failure"
+    state["stories"]["alpha"]["jobs"]["short"]["log_error"] = "Drive file missing"
+    store.save(state)
+    long = state["stories"]["alpha"]["jobs"]["long"]
+    short = state["stories"]["alpha"]["jobs"]["short"]
+    assert status_line("alpha", "long", long) == format_status_line(
+        "alpha", "long", long
+    )
+    snapshot = read_status(store)
+    assert snapshot.rows[0] == (
+        "alpha/long: uploaded https://www.youtube.com/watch?v=abc123 "
+        "upload-log: Network failure"
+    )
+    assert snapshot.rows[1] == (
+        "alpha/short: needs_review  quota exceeded upload-log: Drive file missing"
+    )
+    assert snapshot.rows[0] == status_line("alpha", "long", long)
+    assert snapshot.rows[1] == status_line("alpha", "short", short)
 
 
 def test_empty_status_and_locked_message():

@@ -8,6 +8,7 @@ from pathlib import Path
 import requests
 
 from . import google_auth
+from .desktop import format_status_line
 from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
@@ -155,15 +156,7 @@ def main():
                 state = store.load()
                 for sid, story in state["stories"].items():
                     for role, job in story["jobs"].items():
-                        url = (
-                            f"https://www.youtube.com/watch?v={job['video_id']}"
-                            if job.get("video_id")
-                            else ""
-                        )
-                        detail = job.get("error", "")
-                        if job.get("log_error"):
-                            detail = f"{detail} upload-log: {job['log_error']}".strip()
-                        print(f"{sid}/{role}: {job['stage']} {url} {detail}")
+                        print(format_status_line(sid, role, job))
                 if not state["stories"]:
                     print("No stories started yet.")
                 return 0
