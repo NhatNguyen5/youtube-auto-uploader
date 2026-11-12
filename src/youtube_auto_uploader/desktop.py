@@ -228,6 +228,7 @@ class CommandRun:
         self.returncode = None
         self.done = False
         self._interrupted = False
+        self.stop_error = None
         self._signal_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._pump, name="uploader-output", daemon=True
@@ -273,14 +274,23 @@ class CommandRun:
         return events
 
     def interrupt(self):
-        """Send Ctrl+C and return. Does not terminate or kill the process."""
+        """Send Ctrl+C and return. Does not terminate or kill the process.
+
+        When the signal cannot be sent, this returns False, sets
+        ``stop_error``, and does not raise.
+        """
         with self._signal_lock:
-            if self._interrupted or self.done or self.process.poll() is not None:
+            if self._interrupted:
+                return False
+            if self.done or self.process.poll() is not None:
+                self.stop_error = "process already exited"
                 return False
             try:
                 self.process.send_signal(console_interrupt())
-            except (OSError, ValueError):
+            except (OSError, ValueError) as error:
+                self.stop_error = error
                 return False
+            self.stop_error = None
             self._interrupted = True
             return True
 

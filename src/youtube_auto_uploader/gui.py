@@ -212,6 +212,10 @@ class DesktopWindow:
             self._append_log(
                 ">>> stop (Ctrl+C). Waiting for the current step to finish handling it.\n"
             )
+            return
+        current = self.operator.current
+        if current is not None and current.stop_error:
+            self._append_log(f"Could not send stop signal: {current.stop_error}\n")
 
     def _poll(self, run):
         if self._closed:
