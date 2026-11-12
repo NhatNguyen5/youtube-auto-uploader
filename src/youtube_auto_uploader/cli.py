@@ -1,4 +1,6 @@
 import argparse
+import signal
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,7 +48,40 @@ def export_command(settings, base, week):
     return 0
 
 
+def install_console_interrupt_handler():
+    """Let Windows Ctrl+Break reach the KeyboardInterrupt handler.
+
+    Python installs that handler for SIGINT only. CTRL_BREAK_EVENT arrives as
+    SIGBREAK, and the default action is ExitProcess, which skips finally
+    blocks. A new process group ignores Ctrl+C, so the desktop Stop button
+    sends Ctrl+Break instead.
+    """
+    if sys.platform != "win32":
+        return
+    signal.signal(signal.SIGBREAK, signal.default_int_handler)
+
+
+def interruptible_sleep(seconds):
+    """Sleep for ``seconds``.
+
+    On Windows, SIGBREAK does not wake ``time.sleep``. A poll or quota wait
+    can last for hours, so sleep at most one second at a time and let the
+    pending KeyboardInterrupt run between slices. Other platforms keep one
+    sleep, which SIGINT already interrupts.
+    """
+    if sys.platform != "win32" or seconds <= 1:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(1.0, remaining))
+
+
 def main():
+    install_console_interrupt_handler()
     parser = argparse.ArgumentParser(
         description="Upload Drive story pairs and schedule publication"
     )
@@ -70,7 +105,16 @@ def main():
         "--week",
         help="ISO week file to overwrite, such as 2026-W44. Defaults to the current Pacific week.",
     )
+    commands.add_parser(
+        "gui",
+        help="Open the desktop window",
+        description="Open the desktop window",
+    )
     args = parser.parse_args()
+    if args.command == "gui":
+        from .gui import launch
+
+        return launch(args.config)
     base = args.config.resolve().parent
     try:
         if args.command == "login":
@@ -157,7 +201,9 @@ def main():
                     persist()
                     if args.once:
                         break
-                    time.sleep(settings.poll_seconds if pause is None else pause)
+                    interruptible_sleep(
+                        settings.poll_seconds if pause is None else pause
+                    )
             finally:
                 persist()
                 http.close()
