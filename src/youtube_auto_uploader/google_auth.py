@@ -11,7 +11,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from .storage import atomic_json
 
 # Google rejects Drive scopes and YouTube scopes in one consent request.
-# Login runs the two flows separately and never sets include_granted_scopes.
+# Login runs the two flows separately and sends include_granted_scopes=false.
 DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/drive.file",
@@ -138,6 +138,35 @@ def _client_config(values):
     }
 
 
+def _scope_set(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.split()
+    value = list(value)
+    # google-auth uses an empty grant when it matches the request.
+    if not value:
+        return None
+    return set(value)
+
+
+def _missing_grant(credentials, requested):
+    granted = _scope_set(getattr(credentials, "granted_scopes", None))
+    if granted is None:
+        return []
+    return [scope for scope in requested if scope not in granted]
+
+
+def _permission_name(scope):
+    names = {
+        "https://www.googleapis.com/auth/drive.readonly": "Drive read-only",
+        "https://www.googleapis.com/auth/drive.file": "Drive file",
+        "https://www.googleapis.com/auth/youtube.force-ssl": "YouTube",
+        "https://www.googleapis.com/auth/yt-analytics.readonly": "YouTube Analytics",
+    }
+    return names.get(scope, scope)
+
+
 def login(base):
     _load_env(base)
     values = {
@@ -146,18 +175,36 @@ def login(base):
     missing = [key for key, value in values.items() if not value]
     if missing:
         raise ValueError("Fill in .env: " + ", ".join(missing))
+    drive_path = drive_token_path(base).resolve()
+    youtube_path = youtube_token_path(base).resolve()
+    if drive_path == youtube_path:
+        raise ValueError(
+            "GOOGLE_YOUTUBE_TOKEN_PATH is the same file as GOOGLE_TOKEN_PATH. "
+            "Choose a different file for the YouTube token."
+        )
     config = _client_config(values)
     for index, (role, title, scopes, account) in enumerate(LOGIN_STEPS, start=1):
         print(f"Step {index} of 2: {title}. Sign in with {account}.")
         flow = InstalledAppFlow.from_client_config(config, list(scopes))
-        # include_granted_scopes must not be true: Google would merge the
-        # previous consent's scopes into this request and reject the mix.
+        # false, not omitted and not true: Google must not merge an older grant
+        # into this request, which is what makes the mixed-scope consent fail.
         credentials = flow.run_local_server(
             port=0,
             access_type="offline",
             prompt="consent",
             include_granted_scopes="false",
         )
+        refused = _missing_grant(credentials, scopes)
+        if refused:
+            names = ", ".join(
+                f"{_permission_name(scope)} ({scope})" for scope in refused
+            )
+            message = (
+                f"Step {index} of 2: {title} did not grant {names}. "
+                "Tick every box on the consent screen and run login again."
+            )
+            print(message)
+            raise ValueError(message)
         atomic_json(_path_for(base, role), json.loads(credentials.to_json()))
 
 
@@ -180,12 +227,18 @@ def uses_youtube_token(url):
         "youtubereporting.googleapis.com",
     }:
         return True
-    if host == "www.googleapis.com":
-        if path.startswith("/drive/") or path.startswith("/upload/drive/"):
-            return False
-        # YouTube Data, resumable upload, and reach-report downloads.
+    if host == "www.googleapis.com" and (
+        path.startswith("/youtube/") or path.startswith("/upload/youtube/")
+    ):
         return True
-    raise ValueError("No OAuth token matches this Google API host")
+    if host == "www.googleapis.com" and (
+        path.startswith("/drive/") or path.startswith("/upload/drive/")
+    ):
+        return False
+    raise ValueError(
+        "No OAuth token matches this Google API URL. "
+        "Drive calls use the Drive token and YouTube calls use the YouTube token."
+    )
 
 
 class RoutedSession:

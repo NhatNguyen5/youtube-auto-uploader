@@ -49,6 +49,7 @@ def test_login_requests_two_separate_scope_sets(tmp_path, monkeypatch, capsys):
         def run_local_server(self, **kwargs):
             requested.append((list(self.scopes), kwargs))
             credentials = Mock()
+            credentials.granted_scopes = list(self.scopes)
             credentials.to_json.return_value = json.dumps(_token(self.scopes))
             return credentials
 
@@ -111,7 +112,6 @@ def test_each_api_uses_its_own_token():
         "https://www.googleapis.com/upload/youtube/v3/videos",
         "https://youtubeanalytics.googleapis.com/v2/reports",
         "https://youtubereporting.googleapis.com/v1/jobs",
-        "https://www.googleapis.com/download/v1/media",
     ]
     for url in urls:
         routed.get(url)
@@ -121,6 +121,87 @@ def test_each_api_uses_its_own_token():
         (name, url.split("?", 1)[0]) for name, url in calls
     ]
     assert any(url.endswith("/channels") and name == "youtube" for name, url in calls)
+
+
+def test_unknown_googleapis_url_is_rejected():
+    drive = Mock()
+    youtube = Mock()
+    routed = RoutedSession(drive, youtube)
+    with pytest.raises(ValueError, match="No OAuth token matches"):
+        routed.get("https://www.googleapis.com/oauth2/v3/userinfo")
+    with pytest.raises(ValueError, match="No OAuth token matches"):
+        routed.get("https://www.googleapis.com/download/v1/media")
+    drive.get.assert_not_called()
+    youtube.get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("partial_step", "granted", "missing_scope", "unsaved"),
+    [
+        (1, [DRIVE_SCOPES[0]], "drive.file", "token.json"),
+        (
+            2,
+            "https://www.googleapis.com/auth/youtube.force-ssl",
+            "yt-analytics.readonly",
+            "token.youtube.json",
+        ),
+    ],
+)
+def test_partial_grant_is_not_saved(
+    tmp_path, monkeypatch, capsys, partial_step, granted, missing_scope, unsaved
+):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
+    opened = []
+
+    class FakeFlow:
+        def __init__(self, scopes):
+            self.scopes = list(scopes)
+
+        def run_local_server(self, **kwargs):
+            opened.append(list(self.scopes))
+            credentials = Mock()
+            if len(opened) == partial_step:
+                credentials.granted_scopes = granted
+            else:
+                credentials.granted_scopes = list(self.scopes)
+            credentials.to_json.return_value = json.dumps(_token(self.scopes))
+            return credentials
+
+    monkeypatch.setattr(
+        google_auth.InstalledAppFlow,
+        "from_client_config",
+        lambda _config, scopes: FakeFlow(scopes),
+    )
+    with pytest.raises(ValueError, match="Tick every box"):
+        google_auth.login(tmp_path)
+    text = capsys.readouterr().out
+    assert missing_scope in text
+    assert "Tick every box on the consent screen and run login again." in text
+    assert len(opened) == partial_step
+    assert not (tmp_path / "secrets" / unsaved).exists()
+    if partial_step == 2:
+        saved = json.loads((tmp_path / "secrets" / "token.json").read_text())
+        assert saved["scopes"] == DRIVE_SCOPES
+
+
+def test_identical_token_paths_stop_before_the_browser(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
+    monkeypatch.setenv("GOOGLE_YOUTUBE_TOKEN_PATH", "secrets/token.json")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("browser opened")
+
+    monkeypatch.setattr(
+        google_auth.InstalledAppFlow,
+        "from_client_config",
+        fail_if_called,
+    )
+    with pytest.raises(ValueError, match="same file"):
+        google_auth.login(tmp_path)
 
 
 def test_old_or_missing_tokens_ask_for_login(tmp_path, monkeypatch, capsys):
