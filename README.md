@@ -9,7 +9,7 @@ The initial implementation is available. Automated tests use fake Google service
 1. Install uv and run `uv sync --locked` in this project.
 2. Copy `examples/config.example.json` to `config.json` if it does not exist. Set `youtube_channel_id` to your channel's ID (not its handle). The MidnightUntold Drive root ID is already configured.
 3. Enable Google Drive API, YouTube Data API, YouTube Analytics API, and YouTube Reporting API in your Google Cloud project, configure OAuth consent, and create a **Desktop app** OAuth client. If your consent screen is in testing, add your Google account as a test user. Add the scopes listed in [.env.example](.env.example) to the consent screen. After this list changes, stop the uploader, run `login` again, then start the uploader.
-4. Fill `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`. See [.env.example](.env.example). Login saves refreshable credentials to `GOOGLE_TOKEN_PATH`, defaulting to `secrets/token.json`. Environment variables take precedence over .env. Keep this project in a directory accessible only to your user account.
+4. Fill `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` in `.env`. See [.env.example](.env.example). `login` opens two consent screens, because Google rejects Drive scopes and YouTube scopes in one request. Step 1 is Google Drive (the account that owns the Drive folders) and saves `GOOGLE_TOKEN_PATH`, defaulting to `secrets/token.json`. Step 2 is YouTube (the account that owns the channel) and saves the sibling file `secrets/token.youtube.json`, unless `GOOGLE_YOUTUBE_TOKEN_PATH` is set. A token from the older single consent is not refreshed; run `login` again. Environment variables take precedence over .env. Keep this project in a directory accessible only to your user account.
 5. Run the commands below. `init-state` is for a new installation only; never delete history to resolve a failure.
 
 ```powershell
@@ -120,7 +120,32 @@ Upload and the later schedule update send `made_for_kids` as `status.selfDeclare
 
 The default preparation window is three hours. The machine must be awake and online to download, upload, and submit the schedule. YouTube handles publication after accepting it. Processing time varies, so increase `upload_lead_minutes` for large videos. The short filename identifies your intended variant; YouTube determines Shorts classification.
 
-Each variant has its own saved upload session, video ID, and publication status. A successful long upload is not repeated when the short fails. Once a story becomes due and is snapshotted, later remote config edits do not affect either variant. Drive is read-only; the app does not move folders or add uploaded markers.
+Each variant has its own saved upload session, video ID, and publication status. A successful long upload is not repeated when the short fails. Once a story becomes due and is snapshotted, later remote config edits do not affect either variant. Story folders are left unchanged; the app does not move folders or add per-story marker files.
+
+## Upload log
+
+Set `upload_log_folder_id` in `config.json` to a Drive folder the other reader can access. See [examples/config.example.json](examples/config.example.json). Leave it empty to skip the log. The folder id is not a secret and is not read from `.env`. After a finished upload attempt, the runner appends one line to `uploads.jsonl` in that folder. It creates the file on first use. Do not replace it with a Google Doc of the same name.
+
+The file is JSONL (one JSON object per line). Another program that can only read Drive can download it and parse each line. A Google Sheet would need the Sheets API, and CSV would break on error text that contains commas or quotes. Each line contains:
+
+- `date` — ISO-8601 UTC time captured on the first attempt to record that job
+- `channel` — YouTube channel ID from config, so a later kids channel can share this file
+- `source_file` — Drive file name, such as `long.mp4`
+- `source_file_id` — Drive file ID, because every story reuses the same file names
+- `video_id` — YouTube video ID, or empty when the attempt never received one
+- `status` — `uploaded`, `failed`, or `needs_review`
+- `error` — empty when `status` is `uploaded`
+- `job_id` — `{channel}/{story folder id}/{long|short}`, the idempotency key
+
+```json
+{"schema_version":1,"date":"2026-10-17T00:00:00+00:00","channel":"UCchannel","source_file":"long.mp4","source_file_id":"1abc","video_id":"yt-video-id","status":"uploaded","error":"","job_id":"UCchannel/storyFolderId/long"}
+```
+
+`data/state.json` decides whether YouTube already has the video. A saved video ID is reused and is never uploaded again. `job_id` decides whether the log already has that attempt. Running the same job again, or crashing after Drive stores the line and before local confirmation, does not add a second line. The first outcome for that job stays as written.
+
+The log write happens only after that local result is saved. If Drive rejects the append, the YouTube video stays saved, `status` prints `upload-log: ...`, and a later pass retries the same line. Transfers still in progress, and missed deadlines that never uploaded, are not logged. `uploaded` includes videos that are already scheduled or public. A processing failure noticed after the line was written remains in local state instead of adding another line.
+
+Creating the file needs the Drive file scope (`drive.file`) in addition to read-only Drive. Both are granted on the Drive consent screen, separate from the YouTube screen. Run `uv run youtube-auto-uploader login` again after upgrading. Commands that call Google stop until both tokens exist, and then a pending log line is written. No new value is required in `.env`.
 
 ## Recovery and limitations
 
@@ -129,6 +154,7 @@ Each variant has its own saved upload session, video ID, and publication status.
 - Past deadlines become `missed`; the app does not publish immediately as a fallback. Already accepted schedules are reconciled after their deadline.
 - Active snapshots are immutable. Remote config edits are not currently compared/reported after snapshotting. Rescheduling/cancellation and manually associating previous uploads are not implemented.
 - This installation only knows uploads recorded in its state. Copying a story folder or deleting history can cause duplicates. Exactly-once upload cannot be guaranteed across a network failure and local state write.
+- A failed upload-log write does not remove a saved YouTube ID and does not upload that video again. The next run retries the log line. `status` shows `upload-log:` until the append succeeds.
 - Cache cleanup is manual in this version. Keep unfinished/ambiguous uploads' cache files; completed uploads' files can be removed after stopping the runner and verifying their saved IDs.
 - Transferring one video blocks the single worker until it completes or errors. Processing checks run between transfers; allow ample preparation time for all due videos.
 - Thumbnails, playlists, captions, recursive folders, and Drive shortcuts are not supported yet.
@@ -144,7 +170,7 @@ uv run youtube-auto-uploader gui
 `--config` still comes before the subcommand: `uv run youtube-auto-uploader --config C:\path\config.json gui`.
 
 - **Refresh** shows the same lines as `status`: one line per story variant (`long` and `short`) with the stage, the YouTube URL when a video id is saved, and any error text. With no stories yet, it says `No stories started yet.` If `run` already holds the state lock, from this window or from a terminal, it shows `Runner is active, status locked`. That check does not wait and does not release the lock.
-- **Login** runs `login` and opens the browser for OAuth.
+- **Login** runs `login` and opens the browser twice: first for Google Drive, then for YouTube.
 - **Validate** runs `validate`. It checks that `config.json` loads. It does not call Google and does not upload. The result stays in the checks box.
 - **Validate remote** runs `validate --remote`. It checks the saved credentials, that the signed-in channel matches `youtube_channel_id`, and that each Drive story config is valid. It lists each valid story id and does not upload.
 - **Start runner** runs continuous `run`. Its output streams into the log. The other command buttons stay off until it stops.

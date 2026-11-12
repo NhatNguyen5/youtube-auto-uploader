@@ -8,6 +8,7 @@ from pathlib import Path
 import requests
 
 from . import google_auth
+from .desktop import format_status_line
 from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
@@ -24,12 +25,9 @@ def export_command(settings, base, week):
             raise ValueError(
                 "Set stats_drive_folder_id or stats_channels before export-stats"
             )
-        missing = google_auth.missing_scopes(base)
-        if missing:
-            raise ValueError(
-                "Saved OAuth token is missing scopes. Run login again to grant: "
-                + ", ".join(missing)
-            )
+        message = google_auth.login_message(base)
+        if message:
+            raise ValueError(message)
         http, persist = google_auth.session(base)
         exported = export_stats(settings, base, http, week=week)
     except (ValueError, ApiError) as error:
@@ -133,6 +131,10 @@ def main():
                     parse_json(args.story.read_text(encoding="utf-8-sig"))
                 )
             if args.remote:
+                message = google_auth.login_message(base)
+                if message:
+                    print(message)
+                    return 1
                 http, persist = google_auth.session(base)
                 try:
                     YouTube(http).verify_channel(settings.youtube_channel_id)
@@ -155,18 +157,15 @@ def main():
                 state = store.load()
                 for sid, story in state["stories"].items():
                     for role, job in story["jobs"].items():
-                        url = (
-                            f"https://www.youtube.com/watch?v={job['video_id']}"
-                            if job.get("video_id")
-                            else ""
-                        )
-                        print(
-                            f"{sid}/{role}: {job['stage']} {url} {job.get('error', '')}"
-                        )
+                        print(format_status_line(sid, role, job))
                 if not state["stories"]:
                     print("No stories started yet.")
                 return 0
             store.load()  # Fail before connecting if history is missing/corrupt.
+            message = google_auth.login_message(base)
+            if message:
+                print(message)
+                return 1
             http, persist = google_auth.session(base)
             try:
                 youtube = YouTube(http)

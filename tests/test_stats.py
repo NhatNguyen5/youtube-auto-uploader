@@ -261,7 +261,12 @@ def test_missing_scopes_lists_analytics_and_drive_file(tmp_path, monkeypatch):
     assert "https://www.googleapis.com/auth/yt-analytics.readonly" in missing
     assert "https://www.googleapis.com/auth/drive.file" in missing
     (tmp_path / "token.json").write_text(
-        json.dumps({"scopes": list(google_auth.SCOPES)}), encoding="utf-8"
+        json.dumps({"scopes": list(google_auth.DRIVE_SCOPES)}),
+        encoding="utf-8",
+    )
+    (tmp_path / "token.youtube.json").write_text(
+        json.dumps({"scopes": list(google_auth.YOUTUBE_SCOPES)}),
+        encoding="utf-8",
     )
     assert google_auth.missing_scopes(tmp_path) == []
 
