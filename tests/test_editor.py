@@ -33,6 +33,7 @@ from youtube_auto_uploader.google_auth import (
     YOUTUBE_SCOPES,
 )
 from youtube_auto_uploader.models import Settings, Story
+from youtube_auto_uploader.status import ConfigError
 from youtube_auto_uploader.storage import Store
 
 ROOT = "folder"
@@ -179,6 +180,44 @@ def use_local_offset(monkeypatch):
     monkeypatch.setattr("youtube_auto_uploader.editor.local_zone", lambda: OFFSET)
 
 
+def test_gap_and_fold_times_are_rejected(monkeypatch):
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    with pytest.raises(ConfigError, match="does not exist"):
+        publish_at_from_parts(2026, 3, 8, 2, 30)
+    with pytest.raises(ConfigError, match="happens twice"):
+        publish_at_from_parts(2026, 11, 1, 1, 30)
+    assert publish_at_from_parts(2026, 7, 1, 18, 0) == "2026-07-01T18:00:00-07:00"
+    assert publish_at_from_parts(2026, 12, 15, 18, 0) == "2026-12-15T18:00:00-08:00"
+
+
+def test_libc_path_rejects_the_same_gap_and_fold(monkeypatch):
+    import time
+    from zoneinfo import ZoneInfoNotFoundError
+
+    import youtube_auto_uploader.tz as tz
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("tzset is Unix-only")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+
+    def missing(key):
+        raise ZoneInfoNotFoundError(key)
+
+    monkeypatch.setattr(tz, "ZoneInfo", missing)
+    try:
+        with pytest.raises(ConfigError, match="does not exist"):
+            publish_at_from_parts(2026, 3, 8, 2, 30)
+        with pytest.raises(ConfigError, match="happens twice"):
+            publish_at_from_parts(2026, 11, 1, 1, 30)
+        assert publish_at_from_parts(2026, 7, 1, 18, 0) == "2026-07-01T18:00:00-07:00"
+        assert publish_at_from_parts(2026, 12, 15, 18, 0) == (
+            "2026-12-15T18:00:00-08:00"
+        )
+    finally:
+        os.environ.pop("TZ", None)
+        time.tzset()
+
+
 def test_publish_at_uses_the_offset_on_the_selected_date(monkeypatch):
     monkeypatch.setenv("TZ", "America/New_York")
     assert publish_at_from_parts(2027, 7, 1, 18, 0) == "2027-07-01T18:00:00-04:00"
@@ -263,6 +302,10 @@ def test_story_list_shows_names_stage_local_time_title_and_error(monkeypatch):
 def test_retry_resets_an_unstarted_job_and_keeps_the_story(tmp_path, stage):
     stories = alpha_stories()
     stories["alpha"]["jobs"]["short"]["stage"] = stage
+    stories["alpha"]["jobs"]["short"]["consecutive_failures"] = 10
+    stories["alpha"]["jobs"]["short"]["noticed_publish_at"] = (
+        "2026-01-01T00:00:00+00:00"
+    )
     store = make_store(tmp_path, stories)
     config = write_config(tmp_path / "config.json")
     before_long = json.loads(json.dumps(stories["alpha"]["jobs"]["long"]))
@@ -278,6 +321,8 @@ def test_retry_resets_an_unstarted_job_and_keeps_the_story(tmp_path, stage):
     assert "cache_md5" not in short
     assert short["source"]["id"] == "alpha-short"
     assert short["attempts"] == 0
+    assert short["consecutive_failures"] == 0
+    assert "noticed_publish_at" not in short
     assert saved["stories"]["alpha"]["jobs"]["long"] == before_long
     assert saved["binding"]["drive_folder_id"] == ROOT
 

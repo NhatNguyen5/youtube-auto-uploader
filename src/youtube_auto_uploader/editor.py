@@ -8,7 +8,7 @@ import copy
 import json
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from portalocker.exceptions import AlreadyLocked, LockException
@@ -19,7 +19,7 @@ from . import google_auth
 from .drive import ApiError, Drive, fingerprint, is_video
 from .models import Settings, Story
 from .runner import apply_live_config, upload_started
-from .status import ConfigError, public_error
+from .status import ConfigError, public_error, story_label
 from .storage import Store, atomic_json, parse_json, validate_story_state
 from .tz import local_zone
 
@@ -122,8 +122,18 @@ def format_publish_at(value):
     return f"{local.strftime('%Y-%m-%d %H:%M')} {format_offset(local.utcoffset())}"
 
 
+def _same_wall(moment, numbers):
+    back = moment.astimezone(UTC).astimezone(moment.tzinfo)
+    return (back.year, back.month, back.day, back.hour, back.minute) == tuple(numbers)
+
+
 def publish_at_from_parts(year, month, day, hour, minute):
-    """Local wall time as an ISO-8601 string with an explicit offset."""
+    """Local wall time as an ISO-8601 string with an explicit offset.
+
+    A time the clock skips is rejected, because saving it would come back as
+    a different hour. A time that happens twice when the clock falls back is
+    rejected too, so the two local-zone paths cannot pick different offsets.
+    """
     try:
         numbers = [int(year), int(month), int(day), int(hour), int(minute)]
     except (TypeError, ValueError) as error:
@@ -132,12 +142,27 @@ def publish_at_from_parts(year, month, day, hour, minute):
         ) from error
     zone = local_zone()
     try:
-        moment = datetime(*numbers, tzinfo=zone)
+        kept = []
+        for fold in (0, 1):
+            moment = datetime(*numbers, tzinfo=zone, fold=fold)
+            if moment.utcoffset() is None:
+                continue
+            if _same_wall(moment, numbers):
+                kept.append(moment)
     except (ValueError, OverflowError) as error:
         raise ConfigError("Publish time is not a real local date and time.") from error
-    if moment.utcoffset() is None:
-        raise ConfigError("publish_at requires an explicit timezone offset")
-    return moment.replace(microsecond=0).isoformat()
+    offsets = {item.utcoffset() for item in kept}
+    if not kept:
+        raise ConfigError(
+            "That local time does not exist. "
+            "The clock skips it when daylight saving starts."
+        )
+    if len(offsets) > 1:
+        raise ConfigError(
+            "That local time happens twice when the clock falls back. "
+            "Choose a time that happens once."
+        )
+    return kept[0].replace(microsecond=0).isoformat()
 
 
 def local_clock(value):
@@ -215,9 +240,11 @@ def retry_decision(job):
 def apply_retry(job):
     """Reset one job so live config can pick it up. Does not delete the story."""
     job["stage"] = "waiting"
+    job["consecutive_failures"] = 0
     job.pop("error", None)
     job.pop("next_retry", None)
     job.pop("cache_md5", None)
+    job.pop("noticed_publish_at", None)
 
 
 def _require_job(state, story_id, role):
@@ -291,10 +318,6 @@ def _settings_from_path(config_path):
     return path, settings, Store(path.parent / settings.state_path)
 
 
-def _story_label(name, folder_id):
-    return name or folder_id
-
-
 def _changed_fields(before, after):
     keys = set(before) | set(after)
     return sorted(key for key in keys if before.get(key) != after.get(key))
@@ -313,7 +336,7 @@ def reload_record(state, folder_id, record, story, sources, name):
     A rejection leaves this record as it was. Jobs with a session or video
     id are never changed.
     """
-    label = _story_label(name, folder_id)
+    label = story_label(name, folder_id)
     notes = []
     if name and record.get("name") != name:
         record["name"] = name
@@ -395,14 +418,14 @@ def reload_stories(drive, state, root_id, folder_id=None):
         record = state["stories"].get(sid)
         if record is None:
             notes.append(
-                f"{_story_label(name, sid)}: not in saved history yet. Nothing was added."
+                f"{story_label(name, sid)}: not in saved history yet. Nothing was added."
             )
             continue
         before = copy.deepcopy(record)
         try:
             story, sources = drive.story(sid)
         except Exception as error:
-            notes.append(f"{_story_label(name, sid)}: {public_error(error)}")
+            notes.append(f"{story_label(name, sid)}: {public_error(error)}")
             continue
         story_notes = reload_record(state, sid, record, story, sources, name)
         notes.extend(story_notes)
@@ -412,7 +435,7 @@ def reload_stories(drive, state, root_id, folder_id=None):
         for sid, record in state["stories"].items():
             if sid in seen:
                 continue
-            label = _story_label(record.get("name"), sid)
+            label = story_label(record.get("name"), sid)
             notes.append(f"{label}: not in the Drive folder. It was left as it is.")
     if not notes:
         notes.append("No story folders in this Drive folder.")

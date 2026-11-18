@@ -186,9 +186,21 @@ class _LibcLocal(tzinfo):
         if dt is None:
             return None
         _sync_libc_zone()
+        # fold 0 is the first occurrence (daylight time); fold 1 is the second.
+        isdst = 0 if dt.fold else 1
         try:
             stamp = time.mktime(
-                (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, -1, -1, -1)
+                (
+                    dt.year,
+                    dt.month,
+                    dt.day,
+                    dt.hour,
+                    dt.minute,
+                    dt.second,
+                    -1,
+                    -1,
+                    isdst,
+                )
             )
         except (OverflowError, OSError, ValueError):
             return None
