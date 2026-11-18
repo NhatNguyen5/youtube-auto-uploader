@@ -4,6 +4,8 @@ Windows has no IANA time zone database unless tzdata is installed. Importing
 this module must stay safe on that platform; callers look the zone up lazily.
 """
 
+import os
+import time
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -128,3 +130,157 @@ def pacific_zone():
         return ZoneInfo("America/Los_Angeles")
     except ZoneInfoNotFoundError:
         return _PACIFIC_FALLBACK
+
+
+def _load_zone(name):
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return None
+
+
+def _etc_localtime_name():
+    try:
+        target = os.path.realpath("/etc/localtime")
+    except OSError:
+        return None
+    marker = f"{os.sep}zoneinfo{os.sep}"
+    index = target.rfind(marker)
+    if index == -1:
+        return None
+    name = target[index + len(marker) :]
+    return name or None
+
+
+def _sync_libc_zone():
+    """Make the C library follow TZ. ZoneInfo reads the name itself."""
+    if os.environ.get("TZ") and hasattr(time, "tzset"):
+        time.tzset()
+
+
+def _second_occurrence(local, stamp):
+    """1 when this instant is the later of two times with the same wall clock."""
+    if getattr(local, "tm_isdst", -1) != 0:
+        return 0
+    try:
+        earlier = time.mktime(
+            (
+                local.tm_year,
+                local.tm_mon,
+                local.tm_mday,
+                local.tm_hour,
+                local.tm_min,
+                local.tm_sec,
+                -1,
+                -1,
+                1,
+            )
+        )
+    except (OverflowError, OSError, ValueError):
+        return 0
+    if abs(earlier - stamp) > 1:
+        return 1
+    return 0
+
+
+def _struct_offset(local, stamp):
+    gmtoff = getattr(local, "tm_gmtoff", None)
+    if gmtoff is not None:
+        return timedelta(seconds=int(gmtoff))
+    utc = datetime.fromtimestamp(stamp, UTC).replace(tzinfo=None)
+    wall = datetime(
+        local.tm_year,
+        local.tm_mon,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec,
+    )
+    return wall - utc
+
+
+class _LibcLocal(tzinfo):
+    """Local offset for the wall time in question, from the C library.
+
+    Used when the IANA name cannot be loaded. ``datetime.now().astimezone()``
+    only knows today's offset, so a July date entered in November would be
+    saved an hour off where daylight saving applies.
+    """
+
+    def utcoffset(self, dt):
+        if dt is None:
+            return None
+        _sync_libc_zone()
+        # fold 0 is the first occurrence (daylight time); fold 1 is the second.
+        isdst = 0 if dt.fold else 1
+        try:
+            stamp = time.mktime(
+                (
+                    dt.year,
+                    dt.month,
+                    dt.day,
+                    dt.hour,
+                    dt.minute,
+                    dt.second,
+                    -1,
+                    -1,
+                    isdst,
+                )
+            )
+        except (OverflowError, OSError, ValueError):
+            return None
+        return _struct_offset(time.localtime(stamp), stamp)
+
+    def dst(self, dt):
+        offset = self.utcoffset(dt)
+        if offset is None:
+            return None
+        return timedelta(0)
+
+    def tzname(self, dt):
+        return "local"
+
+    def fromutc(self, dt):
+        if not isinstance(dt, datetime):
+            raise TypeError("fromutc() requires a datetime argument")
+        if dt.tzinfo is not self:
+            raise ValueError("dt.tzinfo is not self")
+        _sync_libc_zone()
+        stamp = dt.replace(tzinfo=UTC).timestamp()
+        local = time.localtime(stamp)
+        return datetime(
+            local.tm_year,
+            local.tm_mon,
+            local.tm_mday,
+            local.tm_hour,
+            local.tm_min,
+            local.tm_sec,
+            dt.microsecond,
+            tzinfo=self,
+            fold=_second_occurrence(local, stamp),
+        )
+
+
+_LIBC_LOCAL = _LibcLocal()
+
+
+def local_zone():
+    """The machine's local zone, looked up on each call.
+
+    An IANA name from ``TZ`` or ``/etc/localtime`` is used when it can be
+    loaded, so the offset is the one in effect on the publication date.
+    Import does not construct a zone. When that name is missing, the C
+    library supplies the offset for the date instead of today's fixed offset.
+    """
+    configured = os.environ.get("TZ")
+    if configured:
+        zone = _load_zone(configured)
+        if zone is not None:
+            return zone
+        return _LIBC_LOCAL
+    name = _etc_localtime_name()
+    if name:
+        zone = _load_zone(name)
+        if zone is not None:
+            return zone
+    return _LIBC_LOCAL

@@ -56,6 +56,69 @@ def upload_started(job):
     return bool(job.get("session") or job.get("video_id"))
 
 
+def source_block(state, file_id, sid):
+    """Why this Drive file cannot be used for this story, or None.
+
+    Another story always blocks. This story blocks only a role that has
+    already started, so the other role cannot upload that file too.
+    """
+    for other_id, record in state["stories"].items():
+        for job in record["jobs"].values():
+            if job["source"]["id"] != file_id:
+                continue
+            if other_id == sid:
+                if upload_started(job):
+                    return "Source already belongs to a video that has started"
+                continue
+            return "Source already belongs to another story"
+    return None
+
+
+def apply_live_config(state, sid, record, story, sources):
+    """Copy publish_at and metadata onto roles that have not started.
+
+    Nothing is written until the merged snapshot is still a valid story and
+    the new file is not one this story has already started. A role with a
+    session or video id is left as it is. Returns whether the record changed.
+    """
+    fresh = story.model_dump(mode="json")
+    snapshot = record["snapshot"]
+    videos = dict(snapshot["videos"])
+    replacements = []
+    for role, job in record["jobs"].items():
+        if upload_started(job):
+            continue
+        new_source = sources[role]
+        if new_source["id"] != job["source"]["id"]:
+            block = source_block(state, new_source["id"], sid)
+            if block:
+                raise ConfigError(block)
+        videos[role] = fresh["videos"][role]
+        replacements.append((role, job, new_source))
+    try:
+        Story.model_validate({**snapshot, "enabled": True, "videos": videos})
+    except ValidationError as error:
+        raise ConfigError(story_reason(error)) from error
+    changed = False
+    if record.get("enabled") is not True:
+        record["enabled"] = True
+        changed = True
+    if snapshot.get("enabled") is not True:
+        snapshot["enabled"] = True
+        changed = True
+    for role, job, new_source in replacements:
+        video = videos[role]
+        if snapshot["videos"][role] != video:
+            snapshot["videos"][role] = video
+            changed = True
+        if job["source"] != new_source:
+            if fingerprint(job["source"]) != fingerprint(new_source):
+                job.pop("cache_md5", None)
+            job["source"] = new_source
+            changed = True
+    return changed
+
+
 def poll_retry(error, failures, once, moment, poll_seconds=30):
     kind = error_kind(error)
     retry_after = getattr(error, "retry_after", 0)
@@ -123,59 +186,10 @@ class Runner:
         ).total_seconds()
 
     def _source_block(self, file_id, sid):
-        # Another story always blocks. This story blocks only a role that
-        # has already started, so the other role cannot upload that file too.
-        for other_id, record in self.state["stories"].items():
-            for job in record["jobs"].values():
-                if job["source"]["id"] != file_id:
-                    continue
-                if other_id == sid:
-                    if upload_started(job):
-                        return "Source already belongs to a video that has started"
-                    continue
-                return "Source already belongs to another story"
-        return None
+        return source_block(self.state, file_id, sid)
 
     def _apply_live_config(self, sid, record, story, sources):
-        # publish_at and metadata follow config.json until an upload starts.
-        # Nothing is written until the merged snapshot is still a valid story
-        # and the new file is not one this story has already started.
-        fresh = story.model_dump(mode="json")
-        snapshot = record["snapshot"]
-        videos = dict(snapshot["videos"])
-        replacements = []
-        for role, job in record["jobs"].items():
-            if upload_started(job):
-                continue
-            new_source = sources[role]
-            if new_source["id"] != job["source"]["id"]:
-                block = self._source_block(new_source["id"], sid)
-                if block:
-                    raise ConfigError(block)
-            videos[role] = fresh["videos"][role]
-            replacements.append((role, job, new_source))
-        try:
-            Story.model_validate({**snapshot, "enabled": True, "videos": videos})
-        except ValidationError as error:
-            raise ConfigError(story_reason(error)) from error
-        changed = False
-        if record.get("enabled") is not True:
-            record["enabled"] = True
-            changed = True
-        if snapshot.get("enabled") is not True:
-            snapshot["enabled"] = True
-            changed = True
-        for role, job, new_source in replacements:
-            video = videos[role]
-            if snapshot["videos"][role] != video:
-                snapshot["videos"][role] = video
-                changed = True
-            if job["source"] != new_source:
-                if fingerprint(job["source"]) != fingerprint(new_source):
-                    job.pop("cache_md5", None)
-                job["source"] = new_source
-                changed = True
-        return changed
+        return apply_live_config(self.state, sid, record, story, sources)
 
     def _mark_waiting(self, sid, role, job, video, record):
         stamp = video.publish_at.isoformat()

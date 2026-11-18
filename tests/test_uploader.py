@@ -252,6 +252,41 @@ def test_atomic_failure_preserves_previous_state(tmp_path, monkeypatch):
     assert parse_json(path.read_text()) == {"old": True}
 
 
+def test_replace_retries_a_windows_permission_error(tmp_path, monkeypatch):
+    import youtube_auto_uploader.storage as storage
+
+    path = tmp_path / "state.json"
+    atomic_json(path, {"old": True})
+    real = storage.os.replace
+    calls = {"n": 0}
+    slept = []
+
+    def wrapped(source, destination):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError("busy")
+        return real(source, destination)
+
+    monkeypatch.setattr(storage.os, "replace", wrapped)
+    monkeypatch.setattr(storage.time, "sleep", slept.append)
+    atomic_json(path, {"new": True})
+    assert calls["n"] == 3
+    assert slept == [0.05, 0.1]
+    assert parse_json(path.read_text()) == {"new": True}
+
+    calls["n"] = 0
+
+    def always_busy(_source, _destination):
+        calls["n"] += 1
+        raise PermissionError("busy")
+
+    monkeypatch.setattr(storage.os, "replace", always_busy)
+    with pytest.raises(PermissionError):
+        atomic_json(path, {"newer": True})
+    assert calls["n"] == 4
+    assert parse_json(path.read_text()) == {"new": True}
+
+
 def _set_story_publish_at(drive, moment):
     story, sources = drive.story.return_value
     data = story.model_dump(mode="json")
@@ -600,6 +635,30 @@ def test_session_is_persisted_before_any_bytes(setup):
 
     youtube.transfer.side_effect = transfer
     runner.step("story", "long", runner.state["stories"]["story"])
+
+
+def test_busy_replace_during_upload_propagates(setup, monkeypatch):
+    runner, store, _drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+
+    def transfer(job, path, checkpoint):
+        monkeypatch.setattr(
+            "youtube_auto_uploader.storage.os.replace",
+            Mock(side_effect=PermissionError("busy")),
+        )
+        monkeypatch.setattr("youtube_auto_uploader.storage.time.sleep", lambda _s: None)
+        job["offset"] = 3
+        checkpoint()
+
+    youtube.transfer.side_effect = transfer
+    with pytest.raises(PermissionError):
+        runner.process("story", "long", record)
+    saved = store.load()["stories"]["story"]["jobs"]["long"]
+    assert saved["session"] == SESSION
+    assert saved["stage"] == "uploading"
+    assert saved.get("error") in (None, "")
+    youtube.transfer.assert_called()
 
 
 def test_storage_failure_prevents_transfer(setup, monkeypatch):

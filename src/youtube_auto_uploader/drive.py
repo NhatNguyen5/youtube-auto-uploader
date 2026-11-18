@@ -106,23 +106,7 @@ class Drive:
             return matches[0]
 
         config = unique("config.json")
-        content = bytearray()
-        with checked(
-            self.http.get(
-                f"{ROOT}/{config['id']}",
-                params={"alt": "media", "supportsAllDrives": "true"},
-                stream=True,
-                timeout=60,
-            )
-        ) as response:
-            for chunk in response.iter_content(65536):
-                content.extend(chunk)
-                if len(content) > 1024 * 1024:
-                    raise ConfigError("Story config exceeds 1 MiB")
-        try:
-            text = content.decode("utf-8-sig")
-        except UnicodeDecodeError as error:
-            raise ConfigError("Story config is not valid UTF-8") from error
+        text = self.read_text(config["id"], 1024 * 1024)
         story = Story.model_validate(parse_json(text))
         sources = {role: unique(video.filename) for role, video in story.videos.items()}
         for source in sources.values():
@@ -135,6 +119,26 @@ class Drive:
             if not source.get("capabilities", {}).get("canDownload", False):
                 raise ConfigError("Source does not permit downloads")
         return story, sources
+
+    def read_text(self, file_id, limit):
+        require_drive_id(file_id, "Drive file ID")
+        content = bytearray()
+        with checked(
+            self.http.get(
+                f"{ROOT}/{file_id}",
+                params={"alt": "media", "supportsAllDrives": "true"},
+                stream=True,
+                timeout=60,
+            )
+        ) as response:
+            for chunk in response.iter_content(65536):
+                content.extend(chunk)
+                if len(content) > limit:
+                    raise ConfigError("Story config exceeds 1 MiB")
+        try:
+            return content.decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise ConfigError("Story config is not valid UTF-8") from error
 
     def download(self, source, target):
         target.parent.mkdir(parents=True, exist_ok=True)

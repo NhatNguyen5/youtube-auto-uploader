@@ -1,12 +1,16 @@
 import json
 import os
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
 import portalocker
 
 from .status import ConfigError
+
+# Windows can refuse os.replace while another process still has the file open.
+_REPLACE_PAUSES = (0.05, 0.1, 0.2)
 
 
 def parse_json(text):
@@ -26,6 +30,29 @@ def parse_json(text):
         ) from error
 
 
+def replace_file(source, destination):
+    """Replace destination with source.
+
+    On Windows, os.replace raises PermissionError while another process still
+    has the destination open. A few short waits usually clear that. The same
+    retry runs for that error on every platform. Any other error is raised
+    immediately, and the destination is left as it was.
+    """
+    last = None
+    for pause in (*_REPLACE_PAUSES, None):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as error:
+            last = error
+            if pause is None:
+                break
+            time.sleep(pause)
+    # PermissionError is an OSError, not a ValueError. The runner must not
+    # treat a busy state file as a bad story config.
+    raise last
+
+
 def atomic_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -35,7 +62,7 @@ def atomic_json(path, data):
             json.dump(data, stream, indent=2, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(name, path)
+        replace_file(name, path)
     finally:
         if os.path.exists(name):
             os.unlink(name)
