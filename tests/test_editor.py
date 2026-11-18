@@ -17,6 +17,8 @@ from youtube_auto_uploader.editor import (
     confirmation_for,
     format_publish_at,
     publish_at_from_parts,
+    reload_from_drive,
+    reload_stories,
     retry_decision,
     retry_saved,
     save_settings,
@@ -645,6 +647,271 @@ def test_collect_stories_lists_drive_folders_by_name(tmp_path, monkeypatch):
     assert long.title == "Named story"
     assert long.publish_local == "2026-11-01 18:00 -06:00"
     assert snapshot.stories[0].video_names == ["long.mp4", "short.mp4"]
+
+
+def source_file(file_id, name):
+    return {
+        "id": file_id,
+        "name": name,
+        "size": "3",
+        "version": "1",
+        "mimeType": "video/mp4",
+    }
+
+
+def enabled_story():
+    raw = story_config()
+    raw["enabled"] = True
+    return raw
+
+
+class ListingDrive:
+    def __init__(self, folders, stories):
+        self.folders = folders
+        self.stories = stories
+        self.story_calls = []
+
+    def children(self, folder):
+        assert folder == ROOT
+        return [
+            {"id": item["id"], "name": item["name"], "mimeType": FOLDER_MIME}
+            for item in self.folders
+        ]
+
+    def story(self, folder_id):
+        self.story_calls.append(folder_id)
+        found = self.stories[folder_id]
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+
+def pair_record(short_stage="pending", short_extra=None, long_extra=None):
+    raw = enabled_story()
+    long_job = job("uploaded", "long-file", video_id="abc123")
+    long_job["source"] = source_file("long-file", "long.mp4")
+    if long_extra:
+        long_job.update(long_extra)
+    short_job = job(short_stage, "short-file")
+    short_job["source"] = source_file("short-file", "short.mp4")
+    if short_extra:
+        short_job.update(short_extra)
+    return {
+        "name": "Midnight Tale",
+        "enabled": True,
+        "snapshot": raw,
+        "jobs": {"long": long_job, "short": short_job},
+    }
+
+
+def listed_story(raw, sources):
+    return Story.model_validate(raw), sources
+
+
+def test_reload_updates_unstarted_jobs_and_reports_started_ones(tmp_path, monkeypatch):
+    from youtube_auto_uploader.editor import apply_live_config as real_apply
+
+    calls = []
+
+    def spy(state, folder_id, record, story, sources):
+        calls.append(folder_id)
+        return real_apply(state, folder_id, record, story, sources)
+
+    monkeypatch.setattr("youtube_auto_uploader.editor.apply_live_config", spy)
+    raw = enabled_story()
+    fresh = json.loads(json.dumps(raw))
+    fresh["videos"]["long"]["title"] = "Should not apply"
+    fresh["videos"]["short"]["title"] = "New short"
+    fresh["videos"]["short"]["publish_at"] = "2026-12-01T18:00:00-06:00"
+    sources = {
+        "long": source_file("long-file", "long.mp4"),
+        "short": source_file("short-new", "short.mp4"),
+    }
+    sources["short"]["md5Checksum"] = "changed"
+    drive = ListingDrive(
+        [{"id": "alpha", "name": "Renamed Tale"}],
+        {"alpha": listed_story(fresh, sources)},
+    )
+    state = {"stories": {"alpha": pair_record(short_extra={"cache_md5": "old"})}}
+    notes, changed = reload_stories(drive, state, ROOT)
+    text = "\n".join(notes)
+    assert calls == ["alpha"]
+    assert changed is True
+    record = state["stories"]["alpha"]
+    assert record["name"] == "Renamed Tale"
+    assert record["snapshot"]["videos"]["long"]["title"] == "Example story - full video"
+    assert record["jobs"]["long"]["video_id"] == "abc123"
+    assert record["jobs"]["long"]["source"]["id"] == "long-file"
+    assert record["snapshot"]["videos"]["short"]["title"] == "New short"
+    assert record["snapshot"]["videos"]["short"]["publish_at"] == (
+        "2026-12-01T18:00:00-06:00"
+    )
+    assert record["jobs"]["short"]["source"]["id"] == "short-new"
+    assert "cache_md5" not in record["jobs"]["short"]
+    assert "renamed to Renamed Tale" in text
+    assert "short:" in text
+    assert "title" in text
+    assert "publish_at" in text
+    assert "file" in text
+    assert "not applied" in text
+    assert "YouTube id" in text
+
+    config = write_config(tmp_path / "config.json")
+    make_store(tmp_path, {"alpha": pair_record(short_extra={"cache_md5": "old"})})
+    monkeypatch.setattr(google_auth, "login_message", lambda _base: None)
+    monkeypatch.setattr(google_auth, "session", lambda _base: (object(), lambda: None))
+
+    class Http:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(google_auth, "session", lambda _base: (Http(), lambda: None))
+    monkeypatch.setattr("youtube_auto_uploader.editor.Drive", lambda _http: drive)
+    result = reload_from_drive(config)
+    assert result.ok is True
+    saved = Store(tmp_path / "data" / "state.json").load()
+    assert saved["stories"]["alpha"]["snapshot"]["videos"]["short"]["title"] == (
+        "New short"
+    )
+    assert saved["stories"]["alpha"]["jobs"]["long"]["video_id"] == "abc123"
+    assert (
+        saved["stories"]["alpha"]["snapshot"]["videos"]["long"]["title"]
+        == "Example story - full video"
+    )
+
+
+def test_reload_rejects_an_unsafe_merge_without_saving(tmp_path):
+    raw = enabled_story()
+    fresh = json.loads(json.dumps(raw))
+    fresh["videos"]["long"]["filename"] = "other.mp4"
+    fresh["videos"]["short"]["filename"] = "long.mp4"
+    drive = ListingDrive(
+        [{"id": "alpha", "name": "Midnight Tale"}],
+        {
+            "alpha": listed_story(
+                fresh,
+                {
+                    "long": source_file("other-file", "other.mp4"),
+                    "short": source_file("short-new", "long.mp4"),
+                },
+            )
+        },
+    )
+    store = make_store(tmp_path, {"alpha": pair_record()})
+    before = store.path.read_bytes()
+    state = store.load()
+    notes, changed = reload_stories(drive, state, ROOT)
+    assert changed is False
+    assert state["stories"]["alpha"]["snapshot"]["videos"]["short"]["filename"] == (
+        "short.mp4"
+    )
+    assert state["stories"]["alpha"]["jobs"]["long"]["video_id"] == "abc123"
+    assert "different files" in "\n".join(notes)
+    assert store.path.read_bytes() == before
+
+
+def test_reload_rejects_a_file_another_story_already_uses():
+    raw = enabled_story()
+    fresh = json.loads(json.dumps(raw))
+    drive = ListingDrive(
+        [
+            {"id": "alpha", "name": "Midnight Tale"},
+            {"id": "beta", "name": "Other"},
+        ],
+        {
+            "alpha": listed_story(
+                fresh,
+                {
+                    "long": source_file("long-file", "long.mp4"),
+                    "short": source_file("taken", "short.mp4"),
+                },
+            )
+        },
+    )
+    beta = pair_record()
+    beta["jobs"]["long"]["source"] = source_file("taken", "other.mp4")
+    beta["snapshot"]["videos"]["long"]["filename"] = "other.mp4"
+    state = {"stories": {"alpha": pair_record(), "beta": beta}}
+    notes, changed = reload_stories(drive, state, ROOT, folder_id="alpha")
+    assert changed is False
+    assert state["stories"]["alpha"]["jobs"]["short"]["source"]["id"] == "short-file"
+    assert state["stories"]["beta"]["jobs"]["long"]["source"]["id"] == "taken"
+    assert "another story" in "\n".join(notes)
+    assert drive.story_calls == ["alpha"]
+
+
+def test_reload_one_story_does_not_read_the_other():
+    raw = enabled_story()
+    fresh = json.loads(json.dumps(raw))
+    fresh["videos"]["short"]["title"] = "Only alpha"
+    drive = ListingDrive(
+        [
+            {"id": "alpha", "name": "Midnight Tale"},
+            {"id": "beta", "name": "Other"},
+        ],
+        {
+            "alpha": listed_story(
+                fresh,
+                {
+                    "long": source_file("long-file", "long.mp4"),
+                    "short": source_file("short-file", "short.mp4"),
+                },
+            )
+        },
+    )
+    state = {
+        "stories": {
+            "alpha": pair_record(),
+            "beta": pair_record(),
+        }
+    }
+    beta_before = json.loads(json.dumps(state["stories"]["beta"]))
+    notes, changed = reload_stories(drive, state, ROOT, folder_id="alpha")
+    assert changed is True
+    assert state["stories"]["beta"] == beta_before
+    assert drive.story_calls == ["alpha"]
+    assert (
+        "Only alpha"
+        in state["stories"]["alpha"]["snapshot"]["videos"]["short"]["title"]
+    )
+    assert "alpha" in "\n".join(notes) or "Midnight Tale" in "\n".join(notes)
+
+
+def test_reload_reports_a_bad_config_and_leaves_history(tmp_path):
+    from youtube_auto_uploader.status import ConfigError
+
+    drive = ListingDrive(
+        [{"id": "alpha", "name": "Midnight Tale"}],
+        {"alpha": ConfigError("Expected one config.json; found 0")},
+    )
+    store = make_store(tmp_path, {"alpha": pair_record()})
+    before = store.path.read_bytes()
+    state = store.load()
+    notes, changed = reload_stories(drive, state, ROOT)
+    assert changed is False
+    assert "Expected one config.json; found 0" in "\n".join(notes)
+    assert state["stories"]["alpha"]["jobs"]["short"]["source"]["id"] == "short-file"
+    assert store.path.read_bytes() == before
+
+
+def test_reload_is_refused_while_the_runner_holds_the_lock(tmp_path, monkeypatch):
+    config = write_config(tmp_path / "config.json")
+    store = make_store(tmp_path, {"alpha": pair_record()})
+    before = store.path.read_bytes()
+
+    def fail_session(_base):
+        raise AssertionError("Drive should not be called")
+
+    monkeypatch.setattr(google_auth, "session", fail_session)
+    held = store.lock()
+    held.acquire()
+    try:
+        result = reload_from_drive(config)
+        assert result.ok is False
+        assert result.message == RUNNER_BUSY
+        assert store.path.read_bytes() == before
+    finally:
+        held.release()
 
 
 def _widgets(widget):

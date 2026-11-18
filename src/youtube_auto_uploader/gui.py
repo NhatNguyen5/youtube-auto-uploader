@@ -23,6 +23,7 @@ from .editor import (
     commit_story_config,
     enabled_default,
     publish_at_from_parts,
+    reload_from_drive,
     retry_saved,
     role_form_defaults,
     save_settings,
@@ -89,6 +90,8 @@ class DesktopWindow:
         self._settings_loaded = False
         self._story_rows = {}
         self._story_state_locked = False
+        self._reload_busy = False
+        self._reload_note = ""
         self._story_queue = queue.Queue()
         self._background_queue = queue.Queue()
         self._background_waiters = 0
@@ -184,6 +187,9 @@ class DesktopWindow:
         self._button(
             bar, "refresh_stories", "Refresh stories", self.refresh_stories
         ).pack(side="left")
+        self._button(
+            bar, "reload_drive", "Reload from Drive", lambda: self._reload_from_drive()
+        ).pack(side="left", padx=(6, 0))
 
         self.stories_message = self.tk.Label(
             parent, text="", justify="left", wraplength=900, anchor="w"
@@ -226,6 +232,14 @@ class DesktopWindow:
         self._button(
             actions, "edit_story", "Edit story", self._edit_selected_story
         ).pack(side="left")
+        reload_one = self._button(
+            actions,
+            "reload_story",
+            "Reload this story",
+            lambda: self._reload_from_drive(self._selected_role()[0]),
+        )
+        reload_one.pack(side="left", padx=(6, 0))
+        reload_one.configure(state="disabled")
         retry = self._button(actions, "retry_role", "Retry", self._retry_selected)
         retry.pack(side="left", padx=(6, 0))
         retry.configure(state="disabled")
@@ -432,7 +446,11 @@ class DesktopWindow:
                     ),
                 )
             tree.item(story.folder_id, open=True)
-        self.stories_message.configure(text=snapshot.message, fg="#333333")
+        message = snapshot.message
+        if self._reload_note:
+            message = f"{self._reload_note}\n{message}".strip()
+            self._reload_note = ""
+        self.stories_message.configure(text=message, fg="#333333")
         self._show_retry_reason()
 
     def _selected_role(self):
@@ -446,6 +464,12 @@ class DesktopWindow:
         return iid, None
 
     def _show_retry_reason(self):
+        try:
+            self._show_retry_reason_text()
+        finally:
+            self._sync_reload_buttons()
+
+    def _show_retry_reason_text(self):
         button = self.buttons["retry_role"]
         self.retry_reason.configure(fg="#333333")
         folder_id, role = self._selected_role()
@@ -480,6 +504,38 @@ class DesktopWindow:
             return
         button.configure(state="normal")
         self.retry_reason.configure(text=row.retry_reason)
+
+    def _sync_reload_buttons(self):
+        folder_id, _role = self._selected_role()
+        busy = self._reload_busy
+        self.buttons["reload_drive"].configure(state="disabled" if busy else "normal")
+        self.buttons["reload_story"].configure(
+            state="normal" if folder_id and not busy else "disabled"
+        )
+
+    def _reload_from_drive(self, folder_id=None):
+        if self._closed or self._reload_busy:
+            return
+        if folder_id is not None and not folder_id:
+            self._show_retry_reason()
+            return
+        self._reload_busy = True
+        self._sync_reload_buttons()
+        self.stories_message.configure(text="Reloading from Drive...", fg="#333333")
+        threading.Thread(
+            target=self._reload_worker,
+            args=(folder_id,),
+            name="uploader-reload",
+            daemon=True,
+        ).start()
+        self._begin_background()
+
+    def _reload_worker(self, folder_id):
+        try:
+            result = reload_from_drive(self.config_path, folder_id)
+        except Exception as error:
+            result = EditResult(message=public_error(error))
+        self._background_queue.put(("reload", result))
 
     def _edit_selected_story(self):
         folder_id, _role = self._selected_role()
@@ -782,6 +838,16 @@ class DesktopWindow:
             self.retry_reason.configure(
                 text=result.message, fg="#1b5e20" if result.ok else "#8b1e1e"
             )
+            self.refresh_stories()
+            return
+        if kind == "reload":
+            result = item[1]
+            self._reload_busy = False
+            self._reload_note = result.message
+            self.stories_message.configure(
+                text=result.message, fg="#1b5e20" if result.ok else "#8b1e1e"
+            )
+            self._sync_reload_buttons()
             self.refresh_stories()
             return
         _kind, top, summary, widgets, save, result = item

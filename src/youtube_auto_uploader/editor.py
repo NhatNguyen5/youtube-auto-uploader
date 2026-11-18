@@ -16,8 +16,9 @@ from pydantic import ValidationError
 from pydantic_core import PydanticUndefined
 
 from . import google_auth
-from .drive import ApiError, Drive, is_video
+from .drive import ApiError, Drive, fingerprint, is_video
 from .models import Settings, Story
+from .runner import apply_live_config, upload_started
 from .status import ConfigError, public_error
 from .storage import Store, atomic_json, parse_json, validate_story_state
 from .tz import local_zone
@@ -288,6 +289,180 @@ def _settings_from_path(config_path):
     path = Path(config_path).resolve()
     settings = Settings.model_validate(parse_json(path.read_text(encoding="utf-8-sig")))
     return path, settings, Store(path.parent / settings.state_path)
+
+
+def _story_label(name, folder_id):
+    return name or folder_id
+
+
+def _changed_fields(before, after):
+    keys = set(before) | set(after)
+    return sorted(key for key in keys if before.get(key) != after.get(key))
+
+
+def _started_reason(job):
+    if job.get("video_id"):
+        return "a YouTube id"
+    return "an upload session"
+
+
+def reload_record(state, folder_id, record, story, sources, name):
+    """Apply one Drive story with the runner's live-config rules.
+
+    Returns lines describing what changed, or why this story was rejected.
+    A rejection leaves this record as it was. Jobs with a session or video
+    id are never changed.
+    """
+    label = _story_label(name, folder_id)
+    notes = []
+    if name and record.get("name") != name:
+        record["name"] = name
+        notes.append(f"{label}: renamed to {name}.")
+    if not story.enabled:
+        if record.get("enabled") is not False:
+            record["enabled"] = False
+            notes.append(f"{label}: disabled. Saved video metadata was not changed.")
+        else:
+            notes.append(f"{label}: disabled. Already skipped.")
+        return notes
+    if all(upload_started(job) for job in record["jobs"].values()):
+        notes.append(
+            f"{label}: left unchanged because every video has already started."
+        )
+        return notes
+    before = copy.deepcopy(record)
+    fresh = story.model_dump(mode="json")
+    try:
+        apply_live_config(state, folder_id, record, story, sources)
+    except (ConfigError, ValidationError) as error:
+        record.clear()
+        record.update(before)
+        notes.append(f"{label}: {public_error(error)}")
+        return notes
+    for role, job in record["jobs"].items():
+        previous = before["jobs"][role]
+        if upload_started(previous):
+            drive_video = fresh["videos"][role]
+            saved_video = before["snapshot"]["videos"][role]
+            if (
+                drive_video != saved_video
+                or sources[role]["id"] != previous["source"]["id"]
+            ):
+                notes.append(
+                    f"{label} {role}: not applied because this video already has "
+                    f"{_started_reason(previous)}."
+                )
+            continue
+        fields = _changed_fields(
+            before["snapshot"]["videos"][role], record["snapshot"]["videos"][role]
+        )
+        if fingerprint(previous["source"]) != fingerprint(job["source"]):
+            fields = sorted({*fields, "file"})
+        if fields:
+            notes.append(f"{label} {role}: {', '.join(fields)}.")
+        else:
+            notes.append(f"{label} {role}: unchanged.")
+    if not notes:
+        notes.append(f"{label}: unchanged.")
+    return notes
+
+
+def reload_stories(drive, state, root_id, folder_id=None):
+    """Reread story configs and apply them to unstarted jobs.
+
+    ``folder_id`` limits the pass to one story. Stories that are not in
+    saved history are reported and not added. A rejected story is left as
+    it was. Returns ``(notes, changed)``.
+    """
+    folders = [
+        item for item in drive.children(root_id) if item.get("mimeType") == FOLDER_MIME
+    ]
+    if folder_id:
+        folders = [item for item in folders if str(item.get("id") or "") == folder_id]
+        if not folders:
+            return [
+                "That story folder is not in the Drive folder. Saved history was not changed."
+            ], False
+    seen = set()
+    notes = []
+    changed = False
+    for folder in folders:
+        sid = str(folder.get("id") or "")
+        if not sid:
+            continue
+        seen.add(sid)
+        name = str(folder.get("name") or sid)
+        record = state["stories"].get(sid)
+        if record is None:
+            notes.append(
+                f"{_story_label(name, sid)}: not in saved history yet. Nothing was added."
+            )
+            continue
+        before = copy.deepcopy(record)
+        try:
+            story, sources = drive.story(sid)
+        except Exception as error:
+            notes.append(f"{_story_label(name, sid)}: {public_error(error)}")
+            continue
+        story_notes = reload_record(state, sid, record, story, sources, name)
+        notes.extend(story_notes)
+        if record != before:
+            changed = True
+    if folder_id is None:
+        for sid, record in state["stories"].items():
+            if sid in seen:
+                continue
+            label = _story_label(record.get("name"), sid)
+            notes.append(f"{label}: not in the Drive folder. It was left as it is.")
+    if not notes:
+        notes.append("No story folders in this Drive folder.")
+    return notes, changed
+
+
+def reload_from_drive(config_path, folder_id=None):
+    """Reread Drive under the run lock and save one atomic state file.
+
+    The runner's ``apply_live_config`` decides which jobs move. This does
+    not call Drive when the runner already holds the lock.
+    """
+    try:
+        path, settings, store = _settings_from_path(config_path)
+    except Exception as error:
+        return EditResult(message=public_error(error))
+    if not store.path.exists():
+        return EditResult(message="State missing. Reload did not create a new history.")
+    lock = store.lock()
+    try:
+        lock.acquire()
+    except AlreadyLocked:
+        return EditResult(message=RUNNER_BUSY)
+    except LockException as error:
+        return EditResult(message=public_error(error))
+    http = None
+    persist = None
+    try:
+        blocked = google_auth.login_message(path.parent)
+        if blocked:
+            return EditResult(message=blocked)
+        http, persist = google_auth.session(path.parent)
+        drive = Drive(http)
+        state = store.load()
+        notes, changed = reload_stories(
+            drive, state, settings.drive_folder_id, folder_id
+        )
+        if changed:
+            for story in state["stories"].values():
+                validate_story_state(story)
+            store.save(state)
+        return EditResult(ok=True, message="\n".join(notes))
+    except Exception as error:
+        return EditResult(message=public_error(error))
+    finally:
+        if persist:
+            persist()
+        if http:
+            http.close()
+        lock.release()
 
 
 def retry_saved(config_path, story_id, role):
