@@ -13,13 +13,14 @@ from .desktop import (
     log_header,
     status_text,
 )
-from .status import public_error
+from .status import configure_stdio, public_error
 
 POLL_MS = 100
 CHECKS_PLACEHOLDER = "No validate result yet."
 
 
 def launch(config_path):
+    configure_stdio()
     try:
         import tkinter as tk
     except ImportError:
