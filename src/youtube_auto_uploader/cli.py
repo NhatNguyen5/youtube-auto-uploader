@@ -189,7 +189,7 @@ def main():
                 state = store.load()
                 for sid, story in state["stories"].items():
                     for role, job in story["jobs"].items():
-                        print(format_status_line(sid, role, job))
+                        print(format_status_line(sid, role, job, story.get("name")))
                 if not state["stories"]:
                     print("No stories started yet.")
                 return 0

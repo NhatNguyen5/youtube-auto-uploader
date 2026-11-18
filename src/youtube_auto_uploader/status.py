@@ -7,7 +7,18 @@ class ConfigError(ValueError):
     """A message this project wrote. Safe to show; no tokens, secrets, or request URLs."""
 
 
-def format_status_line(story_id, role, job):
+def story_label(name, story_id):
+    """Folder name first, with the Drive id in brackets for debugging.
+
+    A missing or blank name falls back to the id alone.
+    """
+    title = name.strip() if isinstance(name, str) else ""
+    if not title or title == story_id:
+        return story_id
+    return f"{title} [{story_id}]"
+
+
+def format_status_line(story_id, role, job, name=None):
     """One status line for the CLI and the desktop window."""
     url = (
         f"https://www.youtube.com/watch?v={job['video_id']}"
@@ -17,7 +28,8 @@ def format_status_line(story_id, role, job):
     detail = job.get("error", "")
     if job.get("log_error"):
         detail = f"{detail} upload-log: {job['log_error']}".strip()
-    return f"{story_id}/{role}: {job['stage']} {url} {detail}"
+    label = story_label(name, story_id)
+    return f"{label} / {role}: {job['stage']} {url} {detail}"
 
 
 def story_reason(error):

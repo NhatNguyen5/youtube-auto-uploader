@@ -36,7 +36,7 @@ from youtube_auto_uploader.desktop import (
     status_text,
     subprocess_kwargs,
 )
-from youtube_auto_uploader.status import format_status_line
+from youtube_auto_uploader.status import format_status_line, story_label
 from youtube_auto_uploader.storage import Store
 
 
@@ -101,10 +101,10 @@ def test_status_lines_match_the_status_command(tmp_path):
     snapshot = read_status(store)
     assert snapshot.locked is False
     assert snapshot.rows == [
-        "alpha/long: uploaded https://www.youtube.com/watch?v=abc123 ",
-        "alpha/short: needs_review  quota exceeded",
-        "beta/long: pending  ",
-        "beta/short: pending  ",
+        "Alpha [alpha] / long: uploaded https://www.youtube.com/watch?v=abc123 ",
+        "Alpha [alpha] / short: needs_review  quota exceeded",
+        "Beta [beta] / long: pending  ",
+        "Beta [beta] / short: pending  ",
     ]
     assert status_text(snapshot) == "\n".join(snapshot.rows)
     with store.lock():
@@ -119,19 +119,88 @@ def test_gui_status_includes_upload_log_error(tmp_path):
     store.save(state)
     long = state["stories"]["alpha"]["jobs"]["long"]
     short = state["stories"]["alpha"]["jobs"]["short"]
-    assert status_line("alpha", "long", long) == format_status_line(
-        "alpha", "long", long
+    assert status_line("alpha", "long", long, "Alpha") == format_status_line(
+        "alpha", "long", long, "Alpha"
     )
     snapshot = read_status(store)
     assert snapshot.rows[0] == (
-        "alpha/long: uploaded https://www.youtube.com/watch?v=abc123 "
+        "Alpha [alpha] / long: uploaded https://www.youtube.com/watch?v=abc123 "
         "upload-log: Network failure"
     )
     assert snapshot.rows[1] == (
-        "alpha/short: needs_review  quota exceeded upload-log: Drive file missing"
+        "Alpha [alpha] / short: needs_review  quota exceeded "
+        "upload-log: Drive file missing"
     )
-    assert snapshot.rows[0] == status_line("alpha", "long", long)
-    assert snapshot.rows[1] == status_line("alpha", "short", short)
+    assert snapshot.rows[0] == status_line("alpha", "long", long, "Alpha")
+    assert snapshot.rows[1] == status_line("alpha", "short", short, "Alpha")
+
+
+def test_story_label_puts_the_name_first_and_falls_back_to_the_id():
+    folder_id = "1fdyS-2RBEBEd7swBLXKYsaZlHwjw2ttG"
+    assert story_label("The Gray Hall", folder_id) == f"The Gray Hall [{folder_id}]"
+    assert story_label(None, folder_id) == folder_id
+    assert story_label("", folder_id) == folder_id
+    assert story_label("   ", folder_id) == folder_id
+    assert story_label(folder_id, folder_id) == folder_id
+    assert story_label(12, folder_id) == folder_id
+
+
+def test_status_shows_story_name_and_review_error(tmp_path):
+    store = Store(tmp_path / "state.json")
+    store.initialize()
+    state = store.load()
+    folder_id = "1fdyS-2RBEBEd7swBLXKYsaZlHwjw2ttG"
+    state["stories"] = {
+        folder_id: {
+            "name": "The Gray Hall",
+            "snapshot": story_snapshot(),
+            "jobs": {
+                "short": job(
+                    "needs_review",
+                    "gray-short",
+                    error="Drive source changed since snapshot",
+                ),
+                "long": job(
+                    "failed",
+                    "gray-long",
+                    video_id="abc123",
+                    error="Category is not assignable",
+                ),
+            },
+        },
+        "unnamed-folder": {
+            "snapshot": story_snapshot(),
+            "jobs": {
+                "short": job(
+                    "needs_review",
+                    "unnamed-short",
+                    error="Insufficient cache disk space",
+                ),
+                "long": job("pending", "unnamed-long"),
+            },
+        },
+    }
+    store.save(state)
+    snapshot = read_status(store)
+    assert snapshot.rows == [
+        (
+            f"The Gray Hall [{folder_id}] / short: needs_review  "
+            "Drive source changed since snapshot"
+        ),
+        (
+            "The Gray Hall "
+            f"[{folder_id}] / long: failed https://www.youtube.com/watch?v=abc123 "
+            "Category is not assignable"
+        ),
+        "unnamed-folder / short: needs_review  Insufficient cache disk space",
+        "unnamed-folder / long: pending  ",
+    ]
+    text = status_text(snapshot)
+    assert text.index("The Gray Hall") < text.index(folder_id)
+    assert "Drive source changed since snapshot" in text
+    assert "Category is not assignable" in text
+    assert "Insufficient cache disk space" in text
+    assert "unnamed-folder / short: needs_review" in text
 
 
 def test_empty_status_and_locked_message():
@@ -188,7 +257,7 @@ def test_collect_status_reads_the_configured_state_file(tmp_path):
     write_config(config)
     saved_state(tmp_path)
     snapshot = collect_status(config)
-    assert snapshot.rows[0].startswith("alpha/long: uploaded ")
+    assert snapshot.rows[0].startswith("Alpha [alpha] / long: uploaded ")
     assert not snapshot.locked
 
 
