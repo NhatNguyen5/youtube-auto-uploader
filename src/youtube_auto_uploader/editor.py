@@ -5,10 +5,9 @@ same run lock the runner holds, as one atomic replace.
 """
 
 import copy
-import json
 import os
 import tempfile
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from portalocker.exceptions import AlreadyLocked, LockException
@@ -16,8 +15,8 @@ from pydantic import ValidationError
 from pydantic_core import PydanticUndefined
 
 from . import google_auth
-from .drive import ApiError, Drive, fingerprint, is_video
-from .models import Settings, Story
+from .drive import Drive, fingerprint, is_video
+from .models import Settings
 from .runner import apply_live_config, upload_started
 from .status import ConfigError, public_error, story_label
 from .storage import Store, atomic_json, parse_json, replace_file, validate_story_state
@@ -33,14 +32,6 @@ SETTINGS_FIELDS = (
     "youtube_channel_id",
     "upload_lead_minutes",
     "poll_seconds",
-)
-_FOREIGN_FILE_REASONS = frozenset(
-    {
-        "insufficientFilePermissions",
-        "insufficientPermissions",
-        "appNotAuthorizedToFile",
-        "forbidden",
-    }
 )
 
 # The runner holds this lock for the whole process, including a transfer.
@@ -120,71 +111,6 @@ def format_publish_at(value):
         return str(value)
     local = moment.astimezone(local_zone()).replace(microsecond=0)
     return f"{local.strftime('%Y-%m-%d %H:%M')} {format_offset(local.utcoffset())}"
-
-
-def _same_wall(moment, numbers):
-    back = moment.astimezone(UTC).astimezone(moment.tzinfo)
-    return (back.year, back.month, back.day, back.hour, back.minute) == tuple(numbers)
-
-
-def publish_at_from_parts(year, month, day, hour, minute):
-    """Local wall time as an ISO-8601 string with an explicit offset.
-
-    A time the clock skips is rejected, because saving it would come back as
-    a different hour. A time that happens twice when the clock falls back is
-    rejected too, so the two local-zone paths cannot pick different offsets.
-    """
-    try:
-        numbers = [int(year), int(month), int(day), int(hour), int(minute)]
-    except (TypeError, ValueError) as error:
-        raise ConfigError(
-            "Publish time needs a year, month, day, hour, and minute."
-        ) from error
-    zone = local_zone()
-    try:
-        kept = []
-        for fold in (0, 1):
-            moment = datetime(*numbers, tzinfo=zone, fold=fold)
-            if moment.utcoffset() is None:
-                continue
-            if _same_wall(moment, numbers):
-                kept.append(moment)
-    except (ValueError, OverflowError) as error:
-        raise ConfigError("Publish time is not a real local date and time.") from error
-    offsets = {item.utcoffset() for item in kept}
-    if not kept:
-        raise ConfigError(
-            "That local time does not exist. "
-            "The clock skips it when daylight saving starts."
-        )
-    if len(offsets) > 1:
-        raise ConfigError(
-            "That local time happens twice when the clock falls back. "
-            "Choose a time that happens once."
-        )
-    return kept[0].replace(microsecond=0).isoformat()
-
-
-def local_clock(value):
-    moment = datetime.fromisoformat(str(value)).astimezone(local_zone())
-    return {
-        "year": moment.year,
-        "month": moment.month,
-        "day": moment.day,
-        "hour": moment.hour,
-        "minute": moment.minute,
-    }
-
-
-def default_clock():
-    moment = datetime.now(local_zone()) + timedelta(days=1)
-    return {
-        "year": moment.year,
-        "month": moment.month,
-        "day": moment.day,
-        "hour": 18,
-        "minute": 0,
-    }
 
 
 def field_errors(error):
@@ -551,20 +477,6 @@ def retry_saved(config_path, story_id, role):
     return result
 
 
-def parse_tags(value):
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return [part.strip() for part in str(value).split(",") if part.strip()]
-
-
-def tags_text(value):
-    if isinstance(value, list):
-        return ", ".join(str(item) for item in value)
-    if value is None:
-        return ""
-    return str(value)
-
-
 def video_dict(raw, role):
     if not isinstance(raw, dict):
         return {}
@@ -573,137 +485,6 @@ def video_dict(raw, role):
         return {}
     video = videos.get(role)
     return video if isinstance(video, dict) else {}
-
-
-def role_form_defaults(raw, role, video_names):
-    video = video_dict(raw, role)
-    publish = video.get("publish_at")
-    try:
-        clock = local_clock(publish) if publish else default_clock()
-    except (TypeError, ValueError):
-        clock = default_clock()
-    filename = str(video.get("filename") or "")
-    names = list(video_names)
-    if not filename and names:
-        filename = names[0] if role == "long" else names[min(1, len(names) - 1)]
-    notify = video.get("notify_subscribers")
-    return {
-        "filename": filename,
-        "title": str(video.get("title") or ""),
-        "description": str(video.get("description") or ""),
-        "tags": tags_text(video.get("tags")),
-        "category_id": str(video.get("category_id") or ""),
-        "made_for_kids": video.get("made_for_kids") is True,
-        "contains_synthetic_media": video.get("contains_synthetic_media") is True,
-        "notify_subscribers": True if notify is None else notify is True,
-        **clock,
-    }
-
-
-def enabled_default(raw):
-    return isinstance(raw, dict) and raw.get("enabled") is True
-
-
-def validate_story_form(raw, form, video_names):
-    """Return ``(story, errors)``. ``story`` is None when ``errors`` is set.
-
-    ``errors`` is keyed by the Story field path so the form can show each one
-    beside its control. The model runs before anything is written.
-    """
-    errors = {}
-    base = raw if isinstance(raw, dict) else {}
-    payload = {
-        "schema_version": base.get("schema_version", 1),
-        "enabled": form.get("enabled"),
-        "videos": {},
-    }
-    videos_in = base.get("videos") if isinstance(base.get("videos"), dict) else {}
-    form_videos = form.get("videos") if isinstance(form.get("videos"), dict) else {}
-    allowed = set(video_names)
-    for role in ROLES:
-        previous = videos_in.get(role)
-        video = dict(previous) if isinstance(previous, dict) else {}
-        part = form_videos.get(role) if isinstance(form_videos.get(role), dict) else {}
-        video["filename"] = str(part.get("filename", "")).strip()
-        video["title"] = str(part.get("title", ""))
-        video["description"] = str(part.get("description", ""))
-        video["tags"] = parse_tags(part.get("tags", []))
-        video["category_id"] = str(part.get("category_id", "")).strip()
-        video["made_for_kids"] = part.get("made_for_kids")
-        video["contains_synthetic_media"] = part.get("contains_synthetic_media")
-        video["notify_subscribers"] = part.get("notify_subscribers")
-        if part.get("publish_at"):
-            video["publish_at"] = part["publish_at"]
-        else:
-            try:
-                video["publish_at"] = publish_at_from_parts(
-                    part.get("year"),
-                    part.get("month"),
-                    part.get("day"),
-                    part.get("hour"),
-                    part.get("minute"),
-                )
-            except ConfigError as error:
-                errors[f"videos.{role}.publish_at"] = str(error)
-                video["publish_at"] = "not-a-date"
-        if video["filename"] not in allowed:
-            errors[f"videos.{role}.filename"] = (
-                "Choose a video file in this story folder."
-            )
-        payload["videos"][role] = video
-    try:
-        story = Story.model_validate(payload)
-    except ValidationError as error:
-        for loc, msg in field_errors(error).items():
-            errors.setdefault(loc, msg)
-        return None, errors
-    if errors:
-        return None, errors
-    return story, {}
-
-
-def story_config_text(story):
-    return (
-        json.dumps(story.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n"
-    )
-
-
-def commit_story_config(config_path, file_id, raw, form, video_names):
-    """Validate, then replace that folder's config.json in place.
-
-    The current Drive scopes cannot update a file this app did not create.
-    In that case this returns the explanation and does not call Drive.
-    """
-    base = Path(config_path).resolve().parent
-    if not file_id:
-        return EditResult(message="This folder has no config.json to update.")
-    _story, errors = validate_story_form(raw, form, video_names)
-    if errors:
-        return EditResult(errors=errors, message="Fix the fields below before saving.")
-    blocked = google_auth.story_config_write_block(base)
-    if blocked:
-        return EditResult(message=blocked)
-    story, errors = validate_story_form(raw, form, video_names)
-    if errors or story is None:
-        return EditResult(errors=errors, message="Fix the fields below before saving.")
-    text = story_config_text(story)
-    http = None
-    persist = None
-    try:
-        http, persist = google_auth.session(base)
-        Drive(http).update_text_file(file_id, text)
-    except ApiError as error:
-        if error.status == 403 and error.reason in _FOREIGN_FILE_REASONS:
-            return EditResult(message=google_auth.STORY_CONFIG_WRITE_DENIED)
-        return EditResult(message=public_error(error))
-    except Exception as error:
-        return EditResult(message=public_error(error))
-    finally:
-        if persist:
-            persist()
-        if http:
-            http.close()
-    return EditResult(ok=True, message="Saved config.json in the story folder.")
 
 
 def displayed_setting(raw, field):

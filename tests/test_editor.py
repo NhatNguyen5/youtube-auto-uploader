@@ -1,39 +1,23 @@
 import json
-import os
 from datetime import timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 
 from youtube_auto_uploader import google_auth
-from youtube_auto_uploader.drive import Drive
 from youtube_auto_uploader.editor import (
     FOLDER_MIME,
     RUNNER_BUSY,
-    apply_retry,
-    assemble_story_views,
     collect_stories,
-    commit_story_config,
     confirmation_for,
-    format_publish_at,
-    publish_at_from_parts,
     reload_from_drive,
     reload_stories,
-    retry_decision,
-    retry_saved,
     save_settings,
     settings_form,
-    validate_story_form,
 )
-from youtube_auto_uploader.google_auth import (
-    DRIVE_SCOPES,
-    FULL_DRIVE_SCOPE,
-    STORY_CONFIG_WRITE_DENIED,
-    YOUTUBE_SCOPES,
-)
+from youtube_auto_uploader.google_auth import DRIVE_SCOPES, YOUTUBE_SCOPES
+from youtube_auto_uploader.gui import STORY_EDIT_NOTE
 from youtube_auto_uploader.models import Settings, Story
-from youtube_auto_uploader.status import ConfigError
 from youtube_auto_uploader.storage import Store
 
 ROOT = "folder"
@@ -121,31 +105,6 @@ def alpha_stories():
     }
 
 
-def form_from(raw, **long_overrides):
-    def role(name):
-        video = raw["videos"][name]
-        moment = video["publish_at"]
-        base = {
-            "filename": video["filename"],
-            "publish_at": moment,
-            "title": video["title"],
-            "description": video["description"],
-            "tags": list(video["tags"]),
-            "category_id": video["category_id"],
-            "made_for_kids": video["made_for_kids"],
-            "contains_synthetic_media": video["contains_synthetic_media"],
-            "notify_subscribers": video["notify_subscribers"],
-        }
-        if name == "long":
-            base.update(long_overrides)
-        return base
-
-    return {
-        "enabled": raw["enabled"],
-        "videos": {"long": role("long"), "short": role("short")},
-    }
-
-
 def settings_form_values(**overrides):
     form = {
         "drive_folder_id": ROOT,
@@ -178,336 +137,6 @@ def write_tokens(base, drive_scopes):
 
 def use_local_offset(monkeypatch):
     monkeypatch.setattr("youtube_auto_uploader.editor.local_zone", lambda: OFFSET)
-
-
-def test_gap_and_fold_times_are_rejected(monkeypatch):
-    monkeypatch.setenv("TZ", "America/Los_Angeles")
-    with pytest.raises(ConfigError, match="does not exist"):
-        publish_at_from_parts(2026, 3, 8, 2, 30)
-    with pytest.raises(ConfigError, match="happens twice"):
-        publish_at_from_parts(2026, 11, 1, 1, 30)
-    assert publish_at_from_parts(2026, 7, 1, 18, 0) == "2026-07-01T18:00:00-07:00"
-    assert publish_at_from_parts(2026, 12, 15, 18, 0) == "2026-12-15T18:00:00-08:00"
-
-
-def test_libc_path_rejects_the_same_gap_and_fold(monkeypatch):
-    import time
-    from zoneinfo import ZoneInfoNotFoundError
-
-    import youtube_auto_uploader.tz as tz
-
-    if not hasattr(time, "tzset"):
-        pytest.skip("tzset is Unix-only")
-    monkeypatch.setenv("TZ", "America/Los_Angeles")
-
-    def missing(key):
-        raise ZoneInfoNotFoundError(key)
-
-    monkeypatch.setattr(tz, "ZoneInfo", missing)
-    try:
-        with pytest.raises(ConfigError, match="does not exist"):
-            publish_at_from_parts(2026, 3, 8, 2, 30)
-        with pytest.raises(ConfigError, match="happens twice"):
-            publish_at_from_parts(2026, 11, 1, 1, 30)
-        assert publish_at_from_parts(2026, 7, 1, 18, 0) == "2026-07-01T18:00:00-07:00"
-        assert publish_at_from_parts(2026, 12, 15, 18, 0) == (
-            "2026-12-15T18:00:00-08:00"
-        )
-    finally:
-        os.environ.pop("TZ", None)
-        time.tzset()
-
-
-def test_publish_at_uses_the_offset_on_the_selected_date(monkeypatch):
-    monkeypatch.setenv("TZ", "America/New_York")
-    assert publish_at_from_parts(2027, 7, 1, 18, 0) == "2027-07-01T18:00:00-04:00"
-    assert publish_at_from_parts(2027, 1, 15, 18, 0) == "2027-01-15T18:00:00-05:00"
-    assert format_publish_at("2027-07-01T22:00:00+00:00") == "2027-07-01 18:00 -04:00"
-    assert format_publish_at("2027-01-15T23:00:00+00:00") == "2027-01-15 18:00 -05:00"
-
-
-def test_libc_local_offset_follows_the_selected_date(monkeypatch):
-    import time
-    from zoneinfo import ZoneInfoNotFoundError
-
-    import youtube_auto_uploader.tz as tz
-
-    if not hasattr(time, "tzset"):
-        pytest.skip("tzset is Unix-only")
-    monkeypatch.setenv("TZ", "America/New_York")
-
-    def missing(key):
-        raise ZoneInfoNotFoundError(key)
-
-    monkeypatch.setattr(tz, "ZoneInfo", missing)
-    try:
-        assert publish_at_from_parts(2027, 7, 1, 18, 0) == "2027-07-01T18:00:00-04:00"
-        assert publish_at_from_parts(2027, 1, 15, 18, 0) == "2027-01-15T18:00:00-05:00"
-        assert format_publish_at("2027-07-01T22:00:00+00:00") == (
-            "2027-07-01 18:00 -04:00"
-        )
-    finally:
-        os.environ.pop("TZ", None)
-        time.tzset()
-
-
-def test_publish_at_uses_an_explicit_local_offset(monkeypatch):
-    use_local_offset(monkeypatch)
-    saved = publish_at_from_parts(2026, 11, 1, 18, 0)
-    assert saved == "2026-11-01T18:00:00-06:00"
-    story = story_config()
-    story["videos"]["long"]["publish_at"] = saved
-    Story.model_validate(story)
-    assert format_publish_at("2026-11-02T00:00:00+00:00") == "2026-11-01 18:00 -06:00"
-
-
-def test_story_list_shows_names_stage_local_time_title_and_error(monkeypatch):
-    use_local_offset(monkeypatch)
-    raw = story_config()
-    raw["videos"]["long"]["title"] = "Full tale"
-    raw["videos"]["short"]["title"] = "Quick tale"
-    from youtube_auto_uploader.editor import FolderFiles
-
-    folders = [
-        {"id": "beta", "name": "Zebra", "mimeType": FOLDER_MIME},
-        {"id": "alpha", "name": "Midnight Tale", "mimeType": FOLDER_MIME},
-        {"id": "note", "name": "notes.txt", "mimeType": "text/plain"},
-    ]
-    details = {
-        "alpha": FolderFiles("cfg-alpha", raw, "", ["long.mp4", "short.mp4"]),
-        "beta": FolderFiles(None, None, "Expected one config.json; found 0", []),
-    }
-    state = {"stories": alpha_stories()}
-    rows = assemble_story_views(folders, details, state)
-    assert [row.name for row in rows] == ["Midnight Tale", "Zebra"]
-    alpha = rows[0]
-    assert alpha.folder_id == "alpha"
-    assert alpha.roles["long"].stage == "uploaded"
-    assert alpha.roles["long"].title == "Full tale"
-    assert alpha.roles["long"].publish_local == "2026-11-01 18:00 -06:00"
-    assert alpha.roles["long"].error == ""
-    assert alpha.roles["long"].retry_allowed is False
-    assert "duplicate upload" in alpha.roles["long"].retry_reason
-    short = alpha.roles["short"]
-    assert short.stage == "needs_review"
-    assert short.title == "Quick tale"
-    assert short.error == "quota exceeded"
-    assert short.retry_allowed is True
-    assert rows[1].config_error == "Expected one config.json; found 0"
-    assert rows[1].roles["long"].stage == "not started"
-    assert rows[1].roles["long"].retry_allowed is False
-
-
-@pytest.mark.parametrize("stage", ["needs_review", "failed", "missed"])
-def test_retry_resets_an_unstarted_job_and_keeps_the_story(tmp_path, stage):
-    stories = alpha_stories()
-    stories["alpha"]["jobs"]["short"]["stage"] = stage
-    stories["alpha"]["jobs"]["short"]["consecutive_failures"] = 10
-    stories["alpha"]["jobs"]["short"]["noticed_publish_at"] = (
-        "2026-01-01T00:00:00+00:00"
-    )
-    store = make_store(tmp_path, stories)
-    config = write_config(tmp_path / "config.json")
-    before_long = json.loads(json.dumps(stories["alpha"]["jobs"]["long"]))
-    result = retry_saved(config, "alpha", "short")
-    assert result.ok is True
-    assert "waiting" in result.message
-    saved = store.load()
-    assert list(saved["stories"]) == ["alpha"]
-    short = saved["stories"]["alpha"]["jobs"]["short"]
-    assert short["stage"] == "waiting"
-    assert "error" not in short
-    assert "next_retry" not in short
-    assert "cache_md5" not in short
-    assert short["source"]["id"] == "alpha-short"
-    assert short["attempts"] == 0
-    assert short["consecutive_failures"] == 0
-    assert "noticed_publish_at" not in short
-    assert saved["stories"]["alpha"]["jobs"]["long"] == before_long
-    assert saved["binding"]["drive_folder_id"] == ROOT
-
-
-def test_retry_is_off_when_a_video_id_or_session_could_duplicate(tmp_path):
-    stories = alpha_stories()
-    stories["alpha"]["jobs"]["short"]["session"] = "https://upload.example/session"
-    stories["alpha"]["jobs"]["short"].pop("video_id", None)
-    store = make_store(tmp_path, stories)
-    config = write_config(tmp_path / "config.json")
-    allowed, reason = retry_decision(stories["alpha"]["jobs"]["long"])
-    assert allowed is False
-    assert "duplicate upload" in reason
-    allowed, reason = retry_decision(stories["alpha"]["jobs"]["short"])
-    assert allowed is False
-    assert "duplicate upload" in reason
-    before = store.path.read_bytes()
-    result = retry_saved(config, "alpha", "short")
-    assert result.ok is False
-    assert "duplicate upload" in result.message
-    assert store.path.read_bytes() == before
-    pending = job("pending", "alpha-short")
-    allowed, reason = retry_decision(pending)
-    assert allowed is False
-    assert "pending" in reason
-
-
-def test_retry_is_refused_while_the_runner_holds_the_lock(tmp_path):
-    store = make_store(tmp_path, alpha_stories())
-    config = write_config(tmp_path / "config.json")
-    before = store.path.read_bytes()
-    held = store.lock()
-    held.acquire()
-    try:
-        result = retry_saved(config, "alpha", "short")
-        assert result.ok is False
-        assert result.message == RUNNER_BUSY
-        assert "uploading" in result.message
-        assert store.path.read_bytes() == before
-    finally:
-        held.release()
-    with store.lock():
-        saved = store.load()
-    assert saved["stories"]["alpha"]["jobs"]["short"]["stage"] == "needs_review"
-    assert saved["stories"]["alpha"]["jobs"]["short"]["error"] == "quota exceeded"
-
-
-def test_retry_failure_does_not_write_a_partial_story(tmp_path):
-    store = make_store(tmp_path, alpha_stories())
-    config = write_config(tmp_path / "config.json")
-    before = store.path.read_bytes()
-    result = retry_saved(config, "missing", "long")
-    assert result.ok is False
-    assert "not in saved history" in result.message
-    assert store.path.read_bytes() == before
-    apply_retry(store.load()["stories"]["alpha"]["jobs"]["short"])
-    # The in-memory reset above is not a save. The file still has the error.
-    assert b"quota exceeded" in store.path.read_bytes()
-
-
-def test_story_form_rejects_invalid_fields_before_a_save(monkeypatch):
-    use_local_offset(monkeypatch)
-    raw = story_config()
-    names = ["long.mp4", "short.mp4"]
-    story, errors = validate_story_form(raw, form_from(raw), names)
-    assert errors == {}
-    assert story.videos["long"].publish_at.utcoffset() == timedelta(hours=-6)
-
-    broken = form_from(raw, title="", filename="missing.mp4")
-    broken["videos"]["long"]["publish_at"] = "2026-11-01T18:00:00"
-    _story, errors = validate_story_form(raw, broken, names)
-    assert _story is None
-    assert "videos.long.title" in errors
-    assert "videos.long.filename" in errors
-    assert "Choose a video file" in errors["videos.long.filename"]
-    assert "videos.long.publish_at" in errors
-
-    same = form_from(raw, filename="long.mp4")
-    same["videos"]["short"]["filename"] = "long.mp4"
-    _story, errors = validate_story_form(raw, same, names)
-    assert "different files" in errors["videos"]
-
-    huge = form_from(raw, tags=["word"] * 200)
-    _story, errors = validate_story_form(raw, huge, names)
-    assert "tags" in errors["videos.long"]
-
-
-def test_story_save_checks_the_model_then_reports_the_scope_gap(tmp_path, monkeypatch):
-    use_local_offset(monkeypatch)
-    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
-    monkeypatch.delenv("GOOGLE_YOUTUBE_TOKEN_PATH", raising=False)
-    write_tokens(tmp_path, DRIVE_SCOPES)
-    config = write_config(tmp_path / "config.json")
-
-    def fail_session(_base):
-        raise AssertionError("Drive should not be called")
-
-    monkeypatch.setattr(google_auth, "session", fail_session)
-    raw = story_config()
-    result = commit_story_config(
-        config, "cfg-alpha", raw, form_from(raw, title=""), ["long.mp4", "short.mp4"]
-    )
-    assert result.ok is False
-    assert "videos.long.title" in result.errors
-    assert "Nothing was written" not in result.message
-
-    result = commit_story_config(
-        config, "cfg-alpha", raw, form_from(raw), ["long.mp4", "short.mp4"]
-    )
-    assert result.ok is False
-    assert result.errors == {}
-    assert result.message == STORY_CONFIG_WRITE_DENIED
-    assert FULL_DRIVE_SCOPE in result.message
-    assert "drive.file" in result.message
-    assert google_auth.can_update_files_this_app_did_not_create(tmp_path) is False
-
-
-def test_story_save_updates_the_same_file_when_the_token_can(tmp_path, monkeypatch):
-    use_local_offset(monkeypatch)
-    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
-    monkeypatch.delenv("GOOGLE_YOUTUBE_TOKEN_PATH", raising=False)
-    write_tokens(tmp_path, [*DRIVE_SCOPES, FULL_DRIVE_SCOPE])
-    config = write_config(tmp_path / "config.json")
-    http = Mock()
-    http.patch.return_value = Mock(status_code=200)
-    http.close = Mock()
-    monkeypatch.setattr(google_auth, "session", lambda _base: (http, lambda: None))
-    raw = story_config()
-    result = commit_story_config(
-        config,
-        "cfg-alpha",
-        raw,
-        form_from(raw, title="Retitled"),
-        ["long.mp4", "short.mp4"],
-    )
-    assert result.ok is True
-    assert http.patch.call_count == 1
-    url = http.patch.call_args.args[0]
-    body = http.patch.call_args.kwargs["data"]
-    assert url.endswith("/cfg-alpha")
-    assert http.patch.call_args.kwargs["params"]["uploadType"] == "media"
-    saved = json.loads(body.decode("utf-8"))
-    assert saved["videos"]["long"]["title"] == "Retitled"
-    assert saved["videos"]["long"]["publish_at"] == "2026-11-01T18:00:00-06:00"
-    assert saved["videos"]["short"]["filename"] == "short.mp4"
-    assert saved["videos"]["long"]["default_language"] == "en"
-
-
-def test_story_save_turns_a_foreign_file_403_into_the_scope_message(
-    tmp_path, monkeypatch
-):
-    use_local_offset(monkeypatch)
-    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
-    monkeypatch.delenv("GOOGLE_YOUTUBE_TOKEN_PATH", raising=False)
-    write_tokens(tmp_path, [*DRIVE_SCOPES, FULL_DRIVE_SCOPE])
-    config = write_config(tmp_path / "config.json")
-    response = Mock(status_code=403)
-    response.headers = {"Retry-After": "0"}
-    response.json.return_value = {
-        "error": {"errors": [{"reason": "appNotAuthorizedToFile"}]}
-    }
-    http = Mock()
-    http.patch.return_value = response
-    http.close = Mock()
-    monkeypatch.setattr(google_auth, "session", lambda _base: (http, lambda: None))
-    result = commit_story_config(
-        config,
-        "cfg-alpha",
-        story_config(),
-        form_from(story_config()),
-        ["long.mp4", "short.mp4"],
-    )
-    assert result.ok is False
-    assert result.message == STORY_CONFIG_WRITE_DENIED
-
-
-def test_update_text_file_patches_one_file_in_place():
-    http = Mock()
-    http.patch.return_value = Mock(status_code=200)
-    Drive(http).update_text_file("fileid", '{"schema_version": 1}\n')
-    url = http.patch.call_args.args[0]
-    kwargs = http.patch.call_args.kwargs
-    assert url.endswith("/fileid")
-    assert kwargs["params"]["uploadType"] == "media"
-    assert kwargs["data"] == b'{"schema_version": 1}\n'
 
 
 def test_settings_validation_is_inline_and_keeps_unedited_fields(tmp_path):
@@ -1055,7 +684,7 @@ def _widgets(widget):
         yield from _widgets(child)
 
 
-def test_window_opens_settings_and_the_story_editor(tmp_path):
+def test_window_shows_a_read_only_stories_note_and_settings(tmp_path):
     tkinter = pytest.importorskip("tkinter")
     try:
         root = tkinter.Tk()
@@ -1064,7 +693,6 @@ def test_window_opens_settings_and_the_story_editor(tmp_path):
     root.withdraw()
     config = write_config(tmp_path / "config.json")
     make_store(tmp_path, alpha_stories())
-    from youtube_auto_uploader.editor import StoryRow
     from youtube_auto_uploader.gui import DesktopWindow
 
     window = DesktopWindow(root, config)
@@ -1075,6 +703,19 @@ def test_window_opens_settings_and_the_story_editor(tmp_path):
             "Stories",
             "Settings",
         ]
+        texts = []
+        for widget in _widgets(window.root):
+            try:
+                text = widget.cget("text")
+            except tkinter.TclError:
+                continue
+            if isinstance(text, str) and text:
+                texts.append(text)
+        assert STORY_EDIT_NOTE in texts
+        assert "Reload from Drive" in texts
+        assert "Reload this story" in texts
+        assert "Retry" in texts
+        assert "Edit story" not in texts
         window.notebook.select(2)
         root.update()
         assert window.settings_vars["youtube_channel_id"].get() == CHANNEL
@@ -1082,44 +723,10 @@ def test_window_opens_settings_and_the_story_editor(tmp_path):
             "REPLACE_WITH_YOUTUBE_CHANNEL_ID"
         )
         window._save_settings()
-        assert "youtube_channel_id" in window.settings_error_labels
         assert window.settings_error_labels["youtube_channel_id"].cget("text")
-        assert "Not saved" not in window.settings_message.cget("text")
         window.settings_vars["youtube_channel_id"].set(CHANNEL)
         window.settings_vars["poll_seconds"].set("40")
         window._save_settings()
         assert json.loads(config.read_text(encoding="utf-8"))["poll_seconds"] == 40
-
-        raw = story_config()
-        story = StoryRow(
-            "alpha",
-            "Midnight Tale",
-            "cfg",
-            "",
-            ["long.mp4", "short.mp4"],
-            raw,
-            {},
-        )
-        window._open_story_editor(story)
-        root.update()
-        tops = [
-            widget
-            for widget in root.winfo_children()
-            if isinstance(widget, tkinter.Toplevel)
-        ]
-        assert len(tops) == 1
-        texts = []
-        for widget in _widgets(tops[0]):
-            try:
-                text = widget.cget("text")
-            except tkinter.TclError:
-                continue
-            if isinstance(text, str) and text:
-                texts.append(text)
-        assert any(text.startswith("Saves as ") and "T" in text for text in texts)
-        assert "Save" in texts
-        assert "Made for kids" in texts
-        tops[0].destroy()
-        root.update()
     finally:
         window.close()

@@ -23,21 +23,6 @@ YOUTUBE_SCOPES = [
 ]
 SCOPES = DRIVE_SCOPES + YOUTUBE_SCOPES
 
-# drive.file can update a file this app created. A story config.json is created
-# in Drive by the owner, so files.update on it needs the full Drive scope.
-# Login does not request this scope.
-FULL_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-
-STORY_CONFIG_WRITE_DENIED = (
-    "Cannot update this story's config.json on Drive. "
-    "The Drive login has drive.readonly and drive.file. "
-    "drive.readonly cannot write, and drive.file can only change files this app "
-    "created, such as the upload log and the stats CSV. "
-    "Story config.json is created in the story folder, not by this app, so "
-    f"updating it needs the full Drive scope ({FULL_DRIVE_SCOPE}). "
-    "That scope was not added. Nothing was written."
-)
-
 # (role, consent title, scopes, which Google account to use)
 LOGIN_STEPS = (
     (
@@ -130,33 +115,6 @@ def missing_scopes(base):
             continue
         missing.extend(scope for scope in scopes if scope not in granted)
     return missing
-
-
-def can_update_files_this_app_did_not_create(base):
-    """Whether the Drive token can update a file this app did not create.
-
-    ``drive.readonly`` cannot write. ``drive.file`` covers files this app
-    created or the user opened with this app. Story config.json is neither,
-    so only the full Drive scope can update it in place.
-    """
-    path = _path_for(base, "drive")
-    info = _read_info(path) if path.exists() else None
-    if info is None:
-        return False
-    granted = _granted(info)
-    if granted & _other_scopes("drive"):
-        return False
-    return FULL_DRIVE_SCOPE in granted
-
-
-def story_config_write_block(base):
-    """Why a story config cannot be saved, or None when the token may write it."""
-    if can_update_files_this_app_did_not_create(base):
-        return None
-    login = login_message(base)
-    if login:
-        return f"{login} {STORY_CONFIG_WRITE_DENIED}"
-    return STORY_CONFIG_WRITE_DENIED
 
 
 def login_message(base):

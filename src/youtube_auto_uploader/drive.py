@@ -140,22 +140,6 @@ class Drive:
         except UnicodeDecodeError as error:
             raise ConfigError("Story config is not valid UTF-8") from error
 
-    def update_text_file(self, file_id, text):
-        """Replace a file's bytes in place. Does not create a second file."""
-        require_drive_id(file_id, "Drive file ID")
-        encoded = text.encode("utf-8")
-        if len(encoded) > 1024 * 1024:
-            raise ConfigError("Story config exceeds 1 MiB")
-        checked(
-            self.http.patch(
-                f"{UPLOAD}/{file_id}",
-                params={"uploadType": "media", "supportsAllDrives": "true"},
-                data=encoded,
-                headers={"Content-Type": "application/json; charset=UTF-8"},
-                timeout=60,
-            )
-        )
-
     def download(self, source, target):
         target.parent.mkdir(parents=True, exist_ok=True)
         size = int(source["size"])
