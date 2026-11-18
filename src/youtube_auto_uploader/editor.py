@@ -20,7 +20,7 @@ from .drive import ApiError, Drive, fingerprint, is_video
 from .models import Settings, Story
 from .runner import apply_live_config, upload_started
 from .status import ConfigError, public_error, story_label
-from .storage import Store, atomic_json, parse_json, validate_story_state
+from .storage import Store, atomic_json, parse_json, replace_file, validate_story_state
 from .tz import local_zone
 
 ROLES = ("long", "short")
@@ -390,12 +390,12 @@ def reload_record(state, folder_id, record, story, sources, name):
     return notes
 
 
-def reload_stories(drive, state, root_id, folder_id=None):
-    """Reread story configs and apply them to unstarted jobs.
+def read_drive_stories(drive, root_id, folder_id=None):
+    """Download story configs. Does not touch saved history.
 
-    ``folder_id`` limits the pass to one story. Stories that are not in
-    saved history are reported and not added. A rejected story is left as
-    it was. Returns ``(notes, changed)``.
+    Returns ``(folders, reads)``. ``reads[folder id]`` is ``(story, sources)``
+    or the exception from that folder. A missing single folder returns a
+    note instead, as ``(None, note)``.
     """
     folders = [
         item for item in drive.children(root_id) if item.get("mimeType") == FOLDER_MIME
@@ -403,9 +403,24 @@ def reload_stories(drive, state, root_id, folder_id=None):
     if folder_id:
         folders = [item for item in folders if str(item.get("id") or "") == folder_id]
         if not folders:
-            return [
-                "That story folder is not in the Drive folder. Saved history was not changed."
-            ], False
+            return None, (
+                "That story folder is not in the Drive folder. "
+                "Saved history was not changed."
+            )
+    reads = {}
+    for folder in folders:
+        sid = str(folder.get("id") or "")
+        if not sid:
+            continue
+        try:
+            reads[sid] = drive.story(sid)
+        except Exception as error:
+            reads[sid] = error
+    return folders, reads
+
+
+def apply_reloaded_stories(state, folders, reads, folder_id=None):
+    """Apply configs already read from Drive. Returns ``(notes, changed)``."""
     seen = set()
     notes = []
     changed = False
@@ -416,19 +431,22 @@ def reload_stories(drive, state, root_id, folder_id=None):
         seen.add(sid)
         name = str(folder.get("name") or sid)
         record = state["stories"].get(sid)
+        found = reads.get(sid)
         if record is None:
-            notes.append(
-                f"{story_label(name, sid)}: not in saved history yet. Nothing was added."
-            )
+            if isinstance(found, Exception):
+                notes.append(f"{story_label(name, sid)}: {public_error(found)}")
+            else:
+                notes.append(
+                    f"{story_label(name, sid)}: not in saved history yet. "
+                    "Nothing was added."
+                )
             continue
+        if isinstance(found, Exception):
+            notes.append(f"{story_label(name, sid)}: {public_error(found)}")
+            continue
+        story, sources = found
         before = copy.deepcopy(record)
-        try:
-            story, sources = drive.story(sid)
-        except Exception as error:
-            notes.append(f"{story_label(name, sid)}: {public_error(error)}")
-            continue
-        story_notes = reload_record(state, sid, record, story, sources, name)
-        notes.extend(story_notes)
+        notes.extend(reload_record(state, sid, record, story, sources, name))
         if record != before:
             changed = True
     if folder_id is None:
@@ -442,18 +460,20 @@ def reload_stories(drive, state, root_id, folder_id=None):
     return notes, changed
 
 
-def reload_from_drive(config_path, folder_id=None):
-    """Reread Drive under the run lock and save one atomic state file.
+def reload_stories(drive, state, root_id, folder_id=None):
+    """Reread story configs and apply them to unstarted jobs.
 
-    The runner's ``apply_live_config`` decides which jobs move. This does
-    not call Drive when the runner already holds the lock.
+    ``folder_id`` limits the pass to one story. Stories that are not in
+    saved history are reported and not added. A rejected story is left as
+    it was. Returns ``(notes, changed)``.
     """
-    try:
-        path, settings, store = _settings_from_path(config_path)
-    except Exception as error:
-        return EditResult(message=public_error(error))
-    if not store.path.exists():
-        return EditResult(message="State missing. Reload did not create a new history.")
+    folders, reads = read_drive_stories(drive, root_id, folder_id)
+    if folders is None:
+        return [reads], False
+    return apply_reloaded_stories(state, folders, reads, folder_id)
+
+
+def _apply_under_lock(store, folders, reads, folder_id):
     lock = store.lock()
     try:
         lock.acquire()
@@ -461,18 +481,9 @@ def reload_from_drive(config_path, folder_id=None):
         return EditResult(message=RUNNER_BUSY)
     except LockException as error:
         return EditResult(message=public_error(error))
-    http = None
-    persist = None
     try:
-        blocked = google_auth.login_message(path.parent)
-        if blocked:
-            return EditResult(message=blocked)
-        http, persist = google_auth.session(path.parent)
-        drive = Drive(http)
         state = store.load()
-        notes, changed = reload_stories(
-            drive, state, settings.drive_folder_id, folder_id
-        )
+        notes, changed = apply_reloaded_stories(state, folders, reads, folder_id)
         if changed:
             for story in state["stories"].values():
                 validate_story_state(story)
@@ -481,11 +492,42 @@ def reload_from_drive(config_path, folder_id=None):
     except Exception as error:
         return EditResult(message=public_error(error))
     finally:
+        lock.release()
+
+
+def reload_from_drive(config_path, folder_id=None):
+    """Read Drive first, then take the run lock only to apply the result.
+
+    The runner's ``apply_live_config`` decides which jobs move. A runner
+    that already holds the lock still blocks the save. It does not block
+    the Drive read.
+    """
+    try:
+        path, settings, store = _settings_from_path(config_path)
+    except Exception as error:
+        return EditResult(message=public_error(error))
+    if not store.path.exists():
+        return EditResult(message="State missing. Reload did not create a new history.")
+    blocked = google_auth.login_message(path.parent)
+    if blocked:
+        return EditResult(message=blocked)
+    http = None
+    persist = None
+    try:
+        http, persist = google_auth.session(path.parent)
+        folders, reads = read_drive_stories(
+            Drive(http), settings.drive_folder_id, folder_id
+        )
+    except Exception as error:
+        return EditResult(message=public_error(error))
+    finally:
         if persist:
             persist()
         if http:
             http.close()
-        lock.release()
+    if folders is None:
+        return EditResult(ok=True, message=reads)
+    return _apply_under_lock(store, folders, reads, folder_id)
 
 
 def retry_saved(config_path, story_id, role):
@@ -742,7 +784,7 @@ def _replace_bytes(path, payload):
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(name, path)
+        replace_file(name, path)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -760,8 +802,6 @@ def _save_settings_and_binding(path, store, settings):
         return EditResult(message=public_error(error))
     try:
         data = store.load()
-        previous_binding = copy.deepcopy(data.get("binding"))
-        stories = copy.deepcopy(data.get("stories"))
         data["binding"] = proposed
         for story in data["stories"].values():
             validate_story_state(story)
@@ -772,15 +812,6 @@ def _save_settings_and_binding(path, store, settings):
         except Exception:
             _replace_bytes(path, previous_config)
             raise
-        if data.get("stories") != stories:
-            data["stories"] = stories
-            if previous_binding is None:
-                data.pop("binding", None)
-            else:
-                data["binding"] = previous_binding
-            store.save(data)
-            _replace_bytes(path, previous_config)
-            return EditResult(message="Save stopped because jobs would have changed.")
         return EditResult(
             ok=True,
             message=(

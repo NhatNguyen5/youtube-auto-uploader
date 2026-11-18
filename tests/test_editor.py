@@ -973,21 +973,77 @@ def test_reload_reports_a_bad_config_and_leaves_history(tmp_path):
     assert store.path.read_bytes() == before
 
 
+def test_reload_reads_drive_before_it_takes_the_lock(tmp_path, monkeypatch):
+    config = write_config(tmp_path / "config.json")
+    make_store(tmp_path, {"alpha": pair_record()})
+    events = []
+
+    class Drive:
+        def __init__(self, _http):
+            pass
+
+        def children(self, folder):
+            events.append("read")
+            return [{"id": "alpha", "name": "Midnight Tale", "mimeType": FOLDER_MIME}]
+
+        def story(self, folder_id):
+            events.append("story")
+            raw = enabled_story()
+            return listed_story(
+                raw,
+                {
+                    "long": source_file("long-file", "long.mp4"),
+                    "short": source_file("short-file", "short.mp4"),
+                },
+            )
+
+    class Http:
+        def close(self):
+            pass
+
+    real_lock = Store.lock
+
+    def tracking_lock(self):
+        events.append("lock")
+        return real_lock(self)
+
+    monkeypatch.setattr(google_auth, "login_message", lambda _base: None)
+    monkeypatch.setattr(google_auth, "session", lambda _base: (Http(), lambda: None))
+    monkeypatch.setattr("youtube_auto_uploader.editor.Drive", Drive)
+    monkeypatch.setattr("youtube_auto_uploader.editor.Store.lock", tracking_lock)
+    result = reload_from_drive(config)
+    assert result.ok is True
+    assert events.index("read") < events.index("story") < events.index("lock")
+
+
 def test_reload_is_refused_while_the_runner_holds_the_lock(tmp_path, monkeypatch):
     config = write_config(tmp_path / "config.json")
     store = make_store(tmp_path, {"alpha": pair_record()})
     before = store.path.read_bytes()
+    events = []
 
-    def fail_session(_base):
-        raise AssertionError("Drive should not be called")
+    class Drive:
+        def __init__(self, _http):
+            pass
 
-    monkeypatch.setattr(google_auth, "session", fail_session)
+        def children(self, folder):
+            events.append("read")
+            return []
+
+    class Http:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(google_auth, "login_message", lambda _base: None)
+    monkeypatch.setattr(google_auth, "session", lambda _base: (Http(), lambda: None))
+    monkeypatch.setattr("youtube_auto_uploader.editor.Drive", Drive)
     held = store.lock()
     held.acquire()
     try:
         result = reload_from_drive(config)
         assert result.ok is False
         assert result.message == RUNNER_BUSY
+        assert events == ["read"]
         assert store.path.read_bytes() == before
     finally:
         held.release()

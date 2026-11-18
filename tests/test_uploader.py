@@ -252,6 +252,42 @@ def test_atomic_failure_preserves_previous_state(tmp_path, monkeypatch):
     assert parse_json(path.read_text()) == {"old": True}
 
 
+def test_replace_retries_a_windows_permission_error(tmp_path, monkeypatch):
+    import youtube_auto_uploader.storage as storage
+    from youtube_auto_uploader.status import ConfigError
+
+    path = tmp_path / "state.json"
+    atomic_json(path, {"old": True})
+    real = storage.os.replace
+    calls = {"n": 0}
+    slept = []
+
+    def wrapped(source, destination):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError("busy")
+        return real(source, destination)
+
+    monkeypatch.setattr(storage.os, "replace", wrapped)
+    monkeypatch.setattr(storage.time, "sleep", slept.append)
+    atomic_json(path, {"new": True})
+    assert calls["n"] == 3
+    assert slept == [0.05, 0.1]
+    assert parse_json(path.read_text()) == {"new": True}
+
+    calls["n"] = 0
+
+    def always_busy(_source, _destination):
+        calls["n"] += 1
+        raise PermissionError("busy")
+
+    monkeypatch.setattr(storage.os, "replace", always_busy)
+    with pytest.raises(ConfigError, match="still open"):
+        atomic_json(path, {"newer": True})
+    assert calls["n"] == 4
+    assert parse_json(path.read_text()) == {"new": True}
+
+
 def _set_story_publish_at(drive, moment):
     story, sources = drive.story.return_value
     data = story.model_dump(mode="json")
