@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -176,6 +177,39 @@ def write_tokens(base, drive_scopes):
 
 def use_local_offset(monkeypatch):
     monkeypatch.setattr("youtube_auto_uploader.editor.local_zone", lambda: OFFSET)
+
+
+def test_publish_at_uses_the_offset_on_the_selected_date(monkeypatch):
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert publish_at_from_parts(2027, 7, 1, 18, 0) == "2027-07-01T18:00:00-04:00"
+    assert publish_at_from_parts(2027, 1, 15, 18, 0) == "2027-01-15T18:00:00-05:00"
+    assert format_publish_at("2027-07-01T22:00:00+00:00") == "2027-07-01 18:00 -04:00"
+    assert format_publish_at("2027-01-15T23:00:00+00:00") == "2027-01-15 18:00 -05:00"
+
+
+def test_libc_local_offset_follows_the_selected_date(monkeypatch):
+    import time
+    from zoneinfo import ZoneInfoNotFoundError
+
+    import youtube_auto_uploader.tz as tz
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("tzset is Unix-only")
+    monkeypatch.setenv("TZ", "America/New_York")
+
+    def missing(key):
+        raise ZoneInfoNotFoundError(key)
+
+    monkeypatch.setattr(tz, "ZoneInfo", missing)
+    try:
+        assert publish_at_from_parts(2027, 7, 1, 18, 0) == "2027-07-01T18:00:00-04:00"
+        assert publish_at_from_parts(2027, 1, 15, 18, 0) == "2027-01-15T18:00:00-05:00"
+        assert format_publish_at("2027-07-01T22:00:00+00:00") == (
+            "2027-07-01 18:00 -04:00"
+        )
+    finally:
+        os.environ.pop("TZ", None)
+        time.tzset()
 
 
 def test_publish_at_uses_an_explicit_local_offset(monkeypatch):
