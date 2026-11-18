@@ -423,6 +423,56 @@ def test_missed_with_video_id_is_not_reuploaded(setup):
     assert "long" not in {call.args[1]["id"] for call in youtube.start.call_args_list}
 
 
+def test_started_role_filename_is_not_reused_by_the_other_role(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploading", session=SESSION)
+    before = copy.deepcopy(record["snapshot"])
+
+    def mutate(data):
+        data["videos"]["long"]["filename"] = "renamed-long.mp4"
+        data["videos"]["short"]["filename"] = "long.mp4"
+
+    _replace_story_config(drive, mutate)
+    runner.cycle()
+    assert record["snapshot"] == before
+    assert record["jobs"]["long"]["session"] == SESSION
+    assert record["jobs"]["short"]["stage"] == "pending"
+    youtube.start.assert_not_called()
+    youtube.transfer.assert_called()
+    Story.model_validate(store.load()["stories"]["story"]["snapshot"])
+    assert any("different files" in line for line in reports)
+
+
+def test_config_fetch_failure_does_not_upload_stale_metadata(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploaded", video_id="known")
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "private", "uploadStatus": "uploaded"},
+        "processingDetails": {"processingStatus": "processing"},
+    }
+    drive.story.side_effect = requests.ConnectionError("secret URL must not be logged")
+    runner.cycle()
+    youtube.inspect.assert_called_with("known")
+    youtube.start.assert_not_called()
+    assert record["jobs"]["short"]["stage"] == "pending"
+    text = "\n".join(reports)
+    assert "Story story: ConnectionError" in text
+    assert "secret URL" not in text
+
+    drive.story.side_effect = ApiError(503, "backendError")
+    runner.cycle()
+    youtube.start.assert_not_called()
+    assert "Story story: HTTP 503: backendError" in "\n".join(reports)
+
+
 def test_disabled_story_is_not_uploaded(setup):
     runner, store, drive, youtube = setup
 

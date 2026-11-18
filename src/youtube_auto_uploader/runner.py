@@ -133,7 +133,11 @@ class Runner:
 
     def _apply_live_config(self, sid, record, story, sources):
         # publish_at and metadata follow config.json until an upload starts.
+        # Build the merged snapshot first. A started role keeps its filename,
+        # so the other role must not adopt that same name.
         fresh = story.model_dump(mode="json")
+        snapshot = record["snapshot"]
+        videos = dict(snapshot["videos"])
         replacements = []
         for role, job in record["jobs"].items():
             if upload_started(job):
@@ -143,17 +147,18 @@ class Runner:
                 new_source["id"], sid
             ):
                 raise ConfigError("Source already belongs to another story")
+            videos[role] = fresh["videos"][role]
             replacements.append((role, job, new_source))
+        Story.model_validate({**snapshot, "enabled": True, "videos": videos})
         changed = False
         if record.get("enabled") is not True:
             record["enabled"] = True
             changed = True
-        snapshot = record["snapshot"]
         if snapshot.get("enabled") is not True:
             snapshot["enabled"] = True
             changed = True
         for role, job, new_source in replacements:
-            video = fresh["videos"][role]
+            video = videos[role]
             if snapshot["videos"][role] != video:
                 snapshot["videos"][role] = video
                 changed = True
@@ -244,8 +249,12 @@ class Runner:
                     f"({type(error).__name__}: {error})"
                 )
             except ApiError as error:
+                if existing is not None:
+                    self._skip_unstarted.add(sid)
                 self.report(f"Story {sid}: HTTP {error.status}: {error.reason}")
             except requests.RequestException as error:
+                if existing is not None:
+                    self._skip_unstarted.add(sid)
                 # Do not print the exception text; it may contain a request URL.
                 response = getattr(error, "response", None)
                 status = getattr(response, "status_code", None)
