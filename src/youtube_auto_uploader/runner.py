@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import requests
 from pydantic import ValidationError
 
-from .drive import ApiError
+from .drive import ApiError, fingerprint
 from .models import Story
 from .status import ConfigError
 from .storage import upload_log_job_id, upload_log_outcome
@@ -52,6 +52,10 @@ def scheduled_delay(computed, retry_after=0):
     return max(float(computed), float(retry_after or 0), 1.0)
 
 
+def upload_started(job):
+    return bool(job.get("session") or job.get("video_id"))
+
+
 def poll_retry(error, failures, once, moment, poll_seconds=30):
     kind = error_kind(error)
     retry_after = getattr(error, "retry_after", 0)
@@ -84,6 +88,7 @@ class Runner:
                 "State belongs to a different root folder or YouTube channel"
             )
         self.state["binding"] = binding
+        self._skip_unstarted = set()
         self.save()
 
     def save(self):
@@ -117,7 +122,75 @@ class Runner:
             - self.clock()
         ).total_seconds()
 
+    def _source_taken(self, file_id, sid):
+        for other_id, record in self.state["stories"].items():
+            if other_id == sid:
+                continue
+            for job in record["jobs"].values():
+                if job["source"]["id"] == file_id:
+                    return True
+        return False
+
+    def _apply_live_config(self, sid, record, story, sources):
+        # publish_at and metadata follow config.json until an upload starts.
+        fresh = story.model_dump(mode="json")
+        replacements = []
+        for role, job in record["jobs"].items():
+            if upload_started(job):
+                continue
+            new_source = sources[role]
+            if new_source["id"] != job["source"]["id"] and self._source_taken(
+                new_source["id"], sid
+            ):
+                raise ConfigError("Source already belongs to another story")
+            replacements.append((role, job, new_source))
+        changed = False
+        if record.get("enabled") is not True:
+            record["enabled"] = True
+            changed = True
+        snapshot = record["snapshot"]
+        if snapshot.get("enabled") is not True:
+            snapshot["enabled"] = True
+            changed = True
+        for role, job, new_source in replacements:
+            video = fresh["videos"][role]
+            if snapshot["videos"][role] != video:
+                snapshot["videos"][role] = video
+                changed = True
+            if job["source"] != new_source:
+                if fingerprint(job["source"]) != fingerprint(new_source):
+                    job.pop("cache_md5", None)
+                job["source"] = new_source
+                changed = True
+        return changed
+
+    def _mark_waiting(self, sid, role, job, video):
+        stamp = video.publish_at.isoformat()
+        announce = job.get("noticed_publish_at") != stamp
+        changed = job.get("stage") != "waiting" or "next_retry" in job or announce
+        job["stage"] = "waiting"
+        job.pop("next_retry", None)
+        if announce:
+            job["noticed_publish_at"] = stamp
+            self.report(
+                f"Story {sid} {role}: publish time passed, waiting for a new publish_at"
+            )
+        if changed:
+            self.save()
+
+    def _release_wait(self, job):
+        changed = False
+        if not upload_started(job) and job.get("stage") in {"waiting", "missed"}:
+            job["stage"] = "pending"
+            changed = True
+        if "noticed_publish_at" in job:
+            job.pop("noticed_publish_at")
+            changed = True
+        if changed:
+            self.save()
+
     def discover(self):
+        self._skip_unstarted = set()
         folders = self.drive.children(self.settings.drive_folder_id)
         for folder in folders:
             if folder["mimeType"] != "application/vnd.google-apps.folder":
@@ -126,11 +199,16 @@ class Runner:
             existing = self.state["stories"].get(sid)
             if existing:
                 existing["name"] = folder["name"]
-                # Frozen once work starts. Reconcile existing jobs without changing them.
-                continue
             try:
                 story, sources = self.drive.story(sid)
                 if not story.enabled:
+                    if existing is not None and existing.get("enabled") is not False:
+                        existing["enabled"] = False
+                        self.save()
+                    continue
+                if existing:
+                    if self._apply_live_config(sid, existing, story, sources):
+                        self.save()
                     continue
                 if all(
                     v.publish_at - timedelta(minutes=self.settings.upload_lead_minutes)
@@ -138,15 +216,13 @@ class Runner:
                     for v in story.videos.values()
                 ):
                     continue
-                used = {
-                    j["source"]["id"]
-                    for s in self.state["stories"].values()
-                    for j in s["jobs"].values()
-                }
-                if any(source["id"] in used for source in sources.values()):
+                if any(
+                    self._source_taken(source["id"], sid) for source in sources.values()
+                ):
                     raise ConfigError("Source already belongs to another story")
                 self.state["stories"][sid] = {
                     "name": folder["name"],
+                    "enabled": True,
                     "snapshot": story.model_dump(mode="json"),
                     "jobs": {
                         role: {
@@ -160,6 +236,8 @@ class Runner:
                 }
                 self.save()
             except (ValueError, ValidationError) as error:
+                if existing is not None:
+                    self._skip_unstarted.add(sid)
                 self.report(
                     "Story "
                     f"{sid}: waiting for valid config and two unique videos "
@@ -181,11 +259,19 @@ class Runner:
         video = Story.model_validate(record["snapshot"]).videos[role]
         job = record["jobs"][role]
         stage = job["stage"]
-        if stage in {"published", "missed", "failed", "needs_review"}:
+        if stage in {"published", "failed", "needs_review"}:
+            return
+        # Uploaded videos that missed the schedule window stay missed.
+        # An older unstarted `missed` job is waiting, and can run again.
+        if stage == "missed" and upload_started(job):
             return
         if (
             job.get("next_retry")
             and datetime.fromisoformat(job["next_retry"]) > self.clock()
+        ):
+            return
+        if not upload_started(job) and (
+            record.get("enabled") is False or sid in self._skip_unstarted
         ):
             return
         if job.get("video_id"):
@@ -243,9 +329,9 @@ class Runner:
         # Recover an existing session even after deadline to resolve upload identity.
         if not job.get("session"):
             if self.clock() >= video.publish_at:
-                job["stage"] = "missed"
-                self.save()
+                self._mark_waiting(sid, role, job, video)
                 return
+            self._release_wait(job)
             if self.clock() < video.publish_at - timedelta(
                 minutes=self.settings.upload_lead_minutes
             ):
@@ -270,8 +356,7 @@ class Runner:
             self.save()
         if not job.get("session"):
             if self.clock() >= video.publish_at:
-                job["stage"] = "missed"
-                self.save()
+                self._mark_waiting(sid, role, job, video)
                 return
             self.youtube.validate_category(video.category_id)
             job["session"] = self.youtube.start(video, source)
@@ -282,6 +367,7 @@ class Runner:
 
     def process(self, sid, role, record):
         job = record["jobs"][role]
+        before = job["stage"]
         try:
             self.step(sid, role, record)
         except NeedsReview as error:
@@ -299,16 +385,9 @@ class Runner:
                 else "Network failure; session will be reconciled"
             )
             if kind == "quota":
-                publish_at = (
-                    Story.model_validate(record["snapshot"]).videos[role].publish_at
-                )
-                if (
-                    self.clock() >= publish_at
-                    and not job.get("video_id")
-                    and not job.get("session")
-                ):
-                    job["stage"] = "missed"
-                    job.pop("next_retry", None)
+                video = Story.model_validate(record["snapshot"]).videos[role]
+                if self.clock() >= video.publish_at and not upload_started(job):
+                    self._mark_waiting(sid, role, job, video)
                 else:
                     moment = self.clock()
                     until_reset = (next_quota_reset(moment) - moment).total_seconds()
@@ -337,7 +416,9 @@ class Runner:
             )
             self.save()
         # Storage/OAuth errors deliberately propagate: do not continue remote work.
-        self.report(f"{sid}/{role}: {job['stage']}")
+        # A publish time that is still in the past was already announced once.
+        if not (before == "waiting" and job["stage"] == "waiting"):
+            self.report(f"{sid}/{role}: {job['stage']}")
         self.record_upload_log(sid, role, record)
 
     def record_upload_log(self, sid, role, record):

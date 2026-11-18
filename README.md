@@ -120,7 +120,7 @@ Upload and the later schedule update send `made_for_kids` as `status.selfDeclare
 
 The default preparation window is three hours. The machine must be awake and online to download, upload, and submit the schedule. YouTube handles publication after accepting it. Processing time varies, so increase `upload_lead_minutes` for large videos. The short filename identifies your intended variant; YouTube determines Shorts classification.
 
-Each variant has its own saved upload session, video ID, and publication status. A successful long upload is not repeated when the short fails. Once a story becomes due and is snapshotted, later remote config edits do not affect either variant. Story folders are left unchanged; the app does not move folders or add per-story marker files.
+Each variant has its own saved upload session, video ID, and publication status. A successful long upload is not repeated when the short fails. Every pass re-reads an enabled story's config.json. The current `publish_at` and metadata apply to a variant until that variant has an upload session or a YouTube video id. After that, the saved snapshot stays in place and that role is not uploaded again. A source file that already belongs to another story is rejected. Stories with `enabled` set to false are skipped. Story folders are left unchanged; the app does not move folders or add per-story marker files.
 
 ## Upload log
 
@@ -143,7 +143,7 @@ The file is JSONL (one JSON object per line). Another program that can only read
 
 `data/state.json` decides whether YouTube already has the video. A saved video ID is reused and is never uploaded again. `job_id` decides whether the log already has that attempt. Running the same job again, or crashing after Drive stores the line and before local confirmation, does not add a second line. The first outcome for that job stays as written.
 
-The log write happens only after that local result is saved. If Drive rejects the append, the YouTube video stays saved, `status` prints `upload-log: ...`, and a later pass retries the same line. Transfers still in progress, and missed deadlines that never uploaded, are not logged. `uploaded` includes videos that are already scheduled or public. A processing failure noticed after the line was written remains in local state instead of adding another line.
+The log write happens only after that local result is saved. If Drive rejects the append, the YouTube video stays saved, `status` prints `upload-log: ...`, and a later pass retries the same line. Transfers still in progress, and variants left waiting because the publish time passed before any upload, are not logged. `uploaded` includes videos that are already scheduled or public. A processing failure noticed after the line was written remains in local state instead of adding another line.
 
 Creating the file needs the Drive file scope (`drive.file`) in addition to read-only Drive. Both are granted on the Drive consent screen, separate from the YouTube screen. Run `uv run youtube-auto-uploader login` again after upgrading. Commands that call Google stop until both tokens exist, and then a pending log line is written. No new value is required in `.env`.
 
@@ -151,8 +151,8 @@ Creating the file needs the Drive file scope (`drive.file`) in addition to read-
 
 - Preserve `data/state.json` and the cached videos. State is bound to the configured Drive root and YouTube channel. Missing/corrupt history stops the runner instead of treating old videos as new.
 - Network failures retry with backoff. An expired session, uncertain completion, permission error, or exhausted retry budget becomes `needs_review` and stops automatic work for that video. Inspect the channel and retained state before recovery; an interactive reconciliation command is not implemented yet.
-- Past deadlines become `missed`; the app does not publish immediately as a fallback. Already accepted schedules are reconciled after their deadline.
-- Active snapshots are immutable. Remote config edits are not currently compared/reported after snapshotting. Rescheduling/cancellation and manually associating previous uploads are not implemented.
+- If `publish_at` passes before an upload starts, that variant is skipped (`waiting`) and is not published late. The runner logs `Story <id> <role>: publish time passed, waiting for a new publish_at` once until that `publish_at` changes, not on every poll. A later config.json with a future time is picked up `upload_lead_minutes` before that time. Older state that marked such a variant `missed` is treated as waiting. A variant that already has a video id is never uploaded again; if its saved schedule can no longer be submitted it stays `missed`. Already accepted schedules are reconciled after their deadline.
+- Variants that have not started uploading follow the current config.json. Variants with a session or video id keep the snapshot from when the upload started. Rescheduling or cancelling an already uploaded video, and manually associating previous uploads, are not implemented.
 - This installation only knows uploads recorded in its state. Copying a story folder or deleting history can cause duplicates. Exactly-once upload cannot be guaranteed across a network failure and local state write.
 - A failed upload-log write does not remove a saved YouTube ID and does not upload that video again. The next run retries the log line. `status` shows `upload-log:` until the append succeeds.
 - Cache cleanup is manual in this version. Keep unfinished/ambiguous uploads' cache files; completed uploads' files can be removed after stopping the runner and verifying their saved IDs.
