@@ -1,0 +1,723 @@
+import json
+from datetime import timedelta, timezone
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+from youtube_auto_uploader import google_auth
+from youtube_auto_uploader.drive import Drive
+from youtube_auto_uploader.editor import (
+    FOLDER_MIME,
+    RUNNER_BUSY,
+    apply_retry,
+    assemble_story_views,
+    collect_stories,
+    commit_story_config,
+    confirmation_for,
+    format_publish_at,
+    publish_at_from_parts,
+    retry_decision,
+    retry_saved,
+    save_settings,
+    settings_form,
+    validate_story_form,
+)
+from youtube_auto_uploader.google_auth import (
+    DRIVE_SCOPES,
+    FULL_DRIVE_SCOPE,
+    STORY_CONFIG_WRITE_DENIED,
+    YOUTUBE_SCOPES,
+)
+from youtube_auto_uploader.models import Settings, Story
+from youtube_auto_uploader.storage import Store
+
+ROOT = "folder"
+CHANNEL = "channel"
+OFFSET = timezone(timedelta(hours=-6))
+
+
+def story_config():
+    return json.loads(
+        Path("examples/story-config.example.json").read_text(encoding="utf-8")
+    )
+
+
+def job(stage, source_id, **extra):
+    item = {
+        "stage": stage,
+        "source": {
+            "id": source_id,
+            "name": f"{source_id}.mp4",
+            "size": "3",
+            "version": "1",
+            "mimeType": "video/mp4",
+        },
+        "attempts": 0,
+        "consecutive_failures": 0,
+    }
+    item.update(extra)
+    return item
+
+
+def config_text(**overrides):
+    data = {
+        "schema_version": 1,
+        "drive_folder_id": ROOT,
+        "upload_log_folder_id": "",
+        "youtube_channel_id": CHANNEL,
+        "upload_lead_minutes": 180,
+        "poll_seconds": 30,
+        "state_path": "data/state.json",
+        "cache_dir": "data/cache",
+        "stats_state_path": "data/stats-reach.json",
+    }
+    data.update(overrides)
+    return data
+
+
+def write_config(path, **overrides):
+    path.write_text(json.dumps(config_text(**overrides)), encoding="utf-8")
+    return path
+
+
+def make_store(tmp_path, stories, binding=None):
+    store = Store(tmp_path / "data" / "state.json")
+    store.initialize()
+    state = store.load()
+    state["stories"] = stories
+    state["binding"] = binding or {
+        "drive_folder_id": ROOT,
+        "youtube_channel_id": CHANNEL,
+    }
+    store.save(state)
+    return store
+
+
+def alpha_stories():
+    return {
+        "alpha": {
+            "name": "Alpha",
+            "snapshot": story_config(),
+            "jobs": {
+                "long": job(
+                    "uploaded",
+                    "alpha-long",
+                    video_id="abc123",
+                ),
+                "short": job(
+                    "needs_review",
+                    "alpha-short",
+                    error="quota exceeded",
+                    next_retry="2026-11-01T00:00:00+00:00",
+                    cache_md5="abc",
+                ),
+            },
+        }
+    }
+
+
+def form_from(raw, **long_overrides):
+    def role(name):
+        video = raw["videos"][name]
+        moment = video["publish_at"]
+        base = {
+            "filename": video["filename"],
+            "publish_at": moment,
+            "title": video["title"],
+            "description": video["description"],
+            "tags": list(video["tags"]),
+            "category_id": video["category_id"],
+            "made_for_kids": video["made_for_kids"],
+            "contains_synthetic_media": video["contains_synthetic_media"],
+            "notify_subscribers": video["notify_subscribers"],
+        }
+        if name == "long":
+            base.update(long_overrides)
+        return base
+
+    return {
+        "enabled": raw["enabled"],
+        "videos": {"long": role("long"), "short": role("short")},
+    }
+
+
+def settings_form_values(**overrides):
+    form = {
+        "drive_folder_id": ROOT,
+        "stats_drive_folder_id": "",
+        "upload_log_folder_id": "",
+        "youtube_channel_id": CHANNEL,
+        "upload_lead_minutes": "180",
+        "poll_seconds": "30",
+    }
+    form.update(overrides)
+    return form
+
+
+def write_tokens(base, drive_scopes):
+    secret = base / "secrets"
+    secret.mkdir(parents=True, exist_ok=True)
+    body = {
+        "token": "access",
+        "refresh_token": "refresh",
+        "client_id": "id",
+        "client_secret": "secret",
+    }
+    (secret / "token.json").write_text(
+        json.dumps({**body, "scopes": list(drive_scopes)}), encoding="utf-8"
+    )
+    (secret / "token.youtube.json").write_text(
+        json.dumps({**body, "scopes": list(YOUTUBE_SCOPES)}), encoding="utf-8"
+    )
+
+
+def use_local_offset(monkeypatch):
+    monkeypatch.setattr("youtube_auto_uploader.editor.local_zone", lambda: OFFSET)
+
+
+def test_publish_at_uses_an_explicit_local_offset(monkeypatch):
+    use_local_offset(monkeypatch)
+    saved = publish_at_from_parts(2026, 11, 1, 18, 0)
+    assert saved == "2026-11-01T18:00:00-06:00"
+    story = story_config()
+    story["videos"]["long"]["publish_at"] = saved
+    Story.model_validate(story)
+    assert format_publish_at("2026-11-02T00:00:00+00:00") == "2026-11-01 18:00 -06:00"
+
+
+def test_story_list_shows_names_stage_local_time_title_and_error(monkeypatch):
+    use_local_offset(monkeypatch)
+    raw = story_config()
+    raw["videos"]["long"]["title"] = "Full tale"
+    raw["videos"]["short"]["title"] = "Quick tale"
+    from youtube_auto_uploader.editor import FolderFiles
+
+    folders = [
+        {"id": "beta", "name": "Zebra", "mimeType": FOLDER_MIME},
+        {"id": "alpha", "name": "Midnight Tale", "mimeType": FOLDER_MIME},
+        {"id": "note", "name": "notes.txt", "mimeType": "text/plain"},
+    ]
+    details = {
+        "alpha": FolderFiles("cfg-alpha", raw, "", ["long.mp4", "short.mp4"]),
+        "beta": FolderFiles(None, None, "Expected one config.json; found 0", []),
+    }
+    state = {"stories": alpha_stories()}
+    rows = assemble_story_views(folders, details, state)
+    assert [row.name for row in rows] == ["Midnight Tale", "Zebra"]
+    alpha = rows[0]
+    assert alpha.folder_id == "alpha"
+    assert alpha.roles["long"].stage == "uploaded"
+    assert alpha.roles["long"].title == "Full tale"
+    assert alpha.roles["long"].publish_local == "2026-11-01 18:00 -06:00"
+    assert alpha.roles["long"].error == ""
+    assert alpha.roles["long"].retry_allowed is False
+    assert "duplicate upload" in alpha.roles["long"].retry_reason
+    short = alpha.roles["short"]
+    assert short.stage == "needs_review"
+    assert short.title == "Quick tale"
+    assert short.error == "quota exceeded"
+    assert short.retry_allowed is True
+    assert rows[1].config_error == "Expected one config.json; found 0"
+    assert rows[1].roles["long"].stage == "not started"
+    assert rows[1].roles["long"].retry_allowed is False
+
+
+@pytest.mark.parametrize("stage", ["needs_review", "failed", "missed"])
+def test_retry_resets_an_unstarted_job_and_keeps_the_story(tmp_path, stage):
+    stories = alpha_stories()
+    stories["alpha"]["jobs"]["short"]["stage"] = stage
+    store = make_store(tmp_path, stories)
+    config = write_config(tmp_path / "config.json")
+    before_long = json.loads(json.dumps(stories["alpha"]["jobs"]["long"]))
+    result = retry_saved(config, "alpha", "short")
+    assert result.ok is True
+    assert "waiting" in result.message
+    saved = store.load()
+    assert list(saved["stories"]) == ["alpha"]
+    short = saved["stories"]["alpha"]["jobs"]["short"]
+    assert short["stage"] == "waiting"
+    assert "error" not in short
+    assert "next_retry" not in short
+    assert "cache_md5" not in short
+    assert short["source"]["id"] == "alpha-short"
+    assert short["attempts"] == 0
+    assert saved["stories"]["alpha"]["jobs"]["long"] == before_long
+    assert saved["binding"]["drive_folder_id"] == ROOT
+
+
+def test_retry_is_off_when_a_video_id_or_session_could_duplicate(tmp_path):
+    stories = alpha_stories()
+    stories["alpha"]["jobs"]["short"]["session"] = "https://upload.example/session"
+    stories["alpha"]["jobs"]["short"].pop("video_id", None)
+    store = make_store(tmp_path, stories)
+    config = write_config(tmp_path / "config.json")
+    allowed, reason = retry_decision(stories["alpha"]["jobs"]["long"])
+    assert allowed is False
+    assert "duplicate upload" in reason
+    allowed, reason = retry_decision(stories["alpha"]["jobs"]["short"])
+    assert allowed is False
+    assert "duplicate upload" in reason
+    before = store.path.read_bytes()
+    result = retry_saved(config, "alpha", "short")
+    assert result.ok is False
+    assert "duplicate upload" in result.message
+    assert store.path.read_bytes() == before
+    pending = job("pending", "alpha-short")
+    allowed, reason = retry_decision(pending)
+    assert allowed is False
+    assert "pending" in reason
+
+
+def test_retry_is_refused_while_the_runner_holds_the_lock(tmp_path):
+    store = make_store(tmp_path, alpha_stories())
+    config = write_config(tmp_path / "config.json")
+    before = store.path.read_bytes()
+    held = store.lock()
+    held.acquire()
+    try:
+        result = retry_saved(config, "alpha", "short")
+        assert result.ok is False
+        assert result.message == RUNNER_BUSY
+        assert "uploading" in result.message
+        assert store.path.read_bytes() == before
+    finally:
+        held.release()
+    with store.lock():
+        saved = store.load()
+    assert saved["stories"]["alpha"]["jobs"]["short"]["stage"] == "needs_review"
+    assert saved["stories"]["alpha"]["jobs"]["short"]["error"] == "quota exceeded"
+
+
+def test_retry_failure_does_not_write_a_partial_story(tmp_path):
+    store = make_store(tmp_path, alpha_stories())
+    config = write_config(tmp_path / "config.json")
+    before = store.path.read_bytes()
+    result = retry_saved(config, "missing", "long")
+    assert result.ok is False
+    assert "not in saved history" in result.message
+    assert store.path.read_bytes() == before
+    apply_retry(store.load()["stories"]["alpha"]["jobs"]["short"])
+    # The in-memory reset above is not a save. The file still has the error.
+    assert b"quota exceeded" in store.path.read_bytes()
+
+
+def test_story_form_rejects_invalid_fields_before_a_save(monkeypatch):
+    use_local_offset(monkeypatch)
+    raw = story_config()
+    names = ["long.mp4", "short.mp4"]
+    story, errors = validate_story_form(raw, form_from(raw), names)
+    assert errors == {}
+    assert story.videos["long"].publish_at.utcoffset() == timedelta(hours=-6)
+
+    broken = form_from(raw, title="", filename="missing.mp4")
+    broken["videos"]["long"]["publish_at"] = "2026-11-01T18:00:00"
+    _story, errors = validate_story_form(raw, broken, names)
+    assert _story is None
+    assert "videos.long.title" in errors
+    assert "videos.long.filename" in errors
+    assert "Choose a video file" in errors["videos.long.filename"]
+    assert "videos.long.publish_at" in errors
+
+    same = form_from(raw, filename="long.mp4")
+    same["videos"]["short"]["filename"] = "long.mp4"
+    _story, errors = validate_story_form(raw, same, names)
+    assert "different files" in errors["videos"]
+
+    huge = form_from(raw, tags=["word"] * 200)
+    _story, errors = validate_story_form(raw, huge, names)
+    assert "tags" in errors["videos.long"]
+
+
+def test_story_save_checks_the_model_then_reports_the_scope_gap(tmp_path, monkeypatch):
+    use_local_offset(monkeypatch)
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
+    monkeypatch.delenv("GOOGLE_YOUTUBE_TOKEN_PATH", raising=False)
+    write_tokens(tmp_path, DRIVE_SCOPES)
+    config = write_config(tmp_path / "config.json")
+
+    def fail_session(_base):
+        raise AssertionError("Drive should not be called")
+
+    monkeypatch.setattr(google_auth, "session", fail_session)
+    raw = story_config()
+    result = commit_story_config(
+        config, "cfg-alpha", raw, form_from(raw, title=""), ["long.mp4", "short.mp4"]
+    )
+    assert result.ok is False
+    assert "videos.long.title" in result.errors
+    assert "Nothing was written" not in result.message
+
+    result = commit_story_config(
+        config, "cfg-alpha", raw, form_from(raw), ["long.mp4", "short.mp4"]
+    )
+    assert result.ok is False
+    assert result.errors == {}
+    assert result.message == STORY_CONFIG_WRITE_DENIED
+    assert FULL_DRIVE_SCOPE in result.message
+    assert "drive.file" in result.message
+    assert google_auth.can_update_files_this_app_did_not_create(tmp_path) is False
+
+
+def test_story_save_updates_the_same_file_when_the_token_can(tmp_path, monkeypatch):
+    use_local_offset(monkeypatch)
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
+    monkeypatch.delenv("GOOGLE_YOUTUBE_TOKEN_PATH", raising=False)
+    write_tokens(tmp_path, [*DRIVE_SCOPES, FULL_DRIVE_SCOPE])
+    config = write_config(tmp_path / "config.json")
+    http = Mock()
+    http.patch.return_value = Mock(status_code=200)
+    http.close = Mock()
+    monkeypatch.setattr(google_auth, "session", lambda _base: (http, lambda: None))
+    raw = story_config()
+    result = commit_story_config(
+        config,
+        "cfg-alpha",
+        raw,
+        form_from(raw, title="Retitled"),
+        ["long.mp4", "short.mp4"],
+    )
+    assert result.ok is True
+    assert http.patch.call_count == 1
+    url = http.patch.call_args.args[0]
+    body = http.patch.call_args.kwargs["data"]
+    assert url.endswith("/cfg-alpha")
+    assert http.patch.call_args.kwargs["params"]["uploadType"] == "media"
+    saved = json.loads(body.decode("utf-8"))
+    assert saved["videos"]["long"]["title"] == "Retitled"
+    assert saved["videos"]["long"]["publish_at"] == "2026-11-01T18:00:00-06:00"
+    assert saved["videos"]["short"]["filename"] == "short.mp4"
+    assert saved["videos"]["long"]["default_language"] == "en"
+
+
+def test_story_save_turns_a_foreign_file_403_into_the_scope_message(
+    tmp_path, monkeypatch
+):
+    use_local_offset(monkeypatch)
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
+    monkeypatch.delenv("GOOGLE_YOUTUBE_TOKEN_PATH", raising=False)
+    write_tokens(tmp_path, [*DRIVE_SCOPES, FULL_DRIVE_SCOPE])
+    config = write_config(tmp_path / "config.json")
+    response = Mock(status_code=403)
+    response.headers = {"Retry-After": "0"}
+    response.json.return_value = {
+        "error": {"errors": [{"reason": "appNotAuthorizedToFile"}]}
+    }
+    http = Mock()
+    http.patch.return_value = response
+    http.close = Mock()
+    monkeypatch.setattr(google_auth, "session", lambda _base: (http, lambda: None))
+    result = commit_story_config(
+        config,
+        "cfg-alpha",
+        story_config(),
+        form_from(story_config()),
+        ["long.mp4", "short.mp4"],
+    )
+    assert result.ok is False
+    assert result.message == STORY_CONFIG_WRITE_DENIED
+
+
+def test_update_text_file_patches_one_file_in_place():
+    http = Mock()
+    http.patch.return_value = Mock(status_code=200)
+    Drive(http).update_text_file("fileid", '{"schema_version": 1}\n')
+    url = http.patch.call_args.args[0]
+    kwargs = http.patch.call_args.kwargs
+    assert url.endswith("/fileid")
+    assert kwargs["params"]["uploadType"] == "media"
+    assert kwargs["data"] == b'{"schema_version": 1}\n'
+
+
+def test_settings_validation_is_inline_and_keeps_unedited_fields(tmp_path):
+    config = write_config(
+        tmp_path / "config.json",
+        stats_channels=[],
+        schedule_margin_seconds=90,
+    )
+    shown = settings_form(config)
+    assert shown["youtube_channel_id"] == CHANNEL
+    assert shown["upload_lead_minutes"] == "180"
+    assert shown["stats_drive_folder_id"] == ""
+
+    result = save_settings(
+        config,
+        settings_form_values(
+            youtube_channel_id="REPLACE_WITH_YOUTUBE_CHANNEL_ID",
+            poll_seconds="4",
+            drive_folder_id="",
+            upload_log_folder_id="REPLACE_WITH_UPLOAD_LOG_FOLDER_ID",
+        ),
+    )
+    assert result.ok is False
+    assert "youtube_channel_id" in result.errors
+    assert "poll_seconds" in result.errors
+    assert result.errors["drive_folder_id"] == "Drive folder ID is required."
+    assert "upload_log_folder_id" in result.errors
+    assert (
+        json.loads(config.read_text(encoding="utf-8"))["schedule_margin_seconds"] == 90
+    )
+
+    store = make_store(tmp_path, alpha_stories())
+    before_jobs = store.load()["stories"]
+    result = save_settings(
+        config,
+        settings_form_values(poll_seconds="45", stats_drive_folder_id=""),
+    )
+    assert result.ok is True
+    assert result.confirmation is None
+    saved = json.loads(config.read_text(encoding="utf-8"))
+    assert saved["poll_seconds"] == 45
+    assert saved["stats_drive_folder_id"] is None
+    assert saved["state_path"] == "data/state.json"
+    assert saved["schedule_margin_seconds"] == 90
+    assert saved["cache_dir"] == "data/cache"
+    Settings.model_validate(saved)
+    assert store.load()["stories"] == before_jobs
+    assert store.load()["binding"]["youtube_channel_id"] == CHANNEL
+
+
+def test_binding_change_waits_for_confirmation_and_keeps_jobs(tmp_path):
+    config = write_config(tmp_path / "config.json")
+    store = make_store(tmp_path, alpha_stories())
+    before = store.path.read_bytes()
+    config_before = config.read_bytes()
+    proposed = settings_form_values(
+        drive_folder_id="other-folder", youtube_channel_id="other-channel"
+    )
+    preview = save_settings(config, proposed, confirm_binding=False)
+    assert preview.ok is False
+    assert preview.confirmation
+    assert ROOT in preview.confirmation
+    assert CHANNEL in preview.confirmation
+    assert "other-folder" in preview.confirmation
+    assert "other-channel" in preview.confirmation
+    assert "Jobs already in state.json stay" in preview.confirmation
+    assert config.read_bytes() == config_before
+    assert store.path.read_bytes() == before
+
+    saved = save_settings(config, proposed, confirm_binding=True)
+    assert saved.ok is True
+    assert "Existing jobs were kept" in saved.message
+    state = store.load()
+    assert state["binding"] == {
+        "drive_folder_id": "other-folder",
+        "youtube_channel_id": "other-channel",
+    }
+    assert set(state["stories"]) == {"alpha"}
+    assert state["stories"]["alpha"]["jobs"]["long"]["video_id"] == "abc123"
+    assert state["stories"]["alpha"]["jobs"]["short"]["stage"] == "needs_review"
+    written = json.loads(config.read_text(encoding="utf-8"))
+    assert written["drive_folder_id"] == "other-folder"
+    assert written["youtube_channel_id"] == "other-channel"
+    assert confirmation_for(state, Settings.model_validate(written)) is None
+
+
+def test_binding_change_is_refused_while_the_runner_is_active(tmp_path):
+    config = write_config(tmp_path / "config.json")
+    store = make_store(tmp_path, alpha_stories())
+    before = store.path.read_bytes()
+    config_before = config.read_bytes()
+    held = store.lock()
+    held.acquire()
+    try:
+        result = save_settings(
+            config,
+            settings_form_values(youtube_channel_id="other-channel"),
+            confirm_binding=True,
+        )
+        assert result.ok is False
+        assert result.message.startswith(RUNNER_BUSY)
+        assert "other-channel" in result.message
+        assert config.read_bytes() == config_before
+        assert store.path.read_bytes() == before
+    finally:
+        held.release()
+
+
+def test_settings_save_restores_config_when_state_cannot_be_saved(
+    tmp_path, monkeypatch
+):
+    config = write_config(tmp_path / "config.json")
+    store = make_store(tmp_path, alpha_stories())
+    before = config.read_bytes()
+    state_before = store.path.read_bytes()
+
+    def fail_save(self, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Store, "save", fail_save)
+    result = save_settings(
+        config,
+        settings_form_values(drive_folder_id="other-folder"),
+        confirm_binding=True,
+    )
+    assert result.ok is False
+    assert config.read_bytes() == before
+    assert store.path.read_bytes() == state_before
+
+
+def test_settings_write_failure_leaves_the_binding_alone(tmp_path, monkeypatch):
+    config = write_config(tmp_path / "config.json")
+    store = make_store(tmp_path, alpha_stories())
+    before = config.read_bytes()
+
+    def fail_config(path, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("youtube_auto_uploader.editor.atomic_json", fail_config)
+    result = save_settings(
+        config,
+        settings_form_values(youtube_channel_id="other-channel"),
+        confirm_binding=True,
+    )
+    assert result.ok is False
+    assert config.read_bytes() == before
+    assert store.load()["binding"]["youtube_channel_id"] == CHANNEL
+    assert store.load()["stories"]["alpha"]["jobs"]["long"]["video_id"] == "abc123"
+
+
+def test_poll_change_does_not_need_the_state_lock(tmp_path):
+    config = write_config(tmp_path / "config.json")
+    store = make_store(tmp_path, alpha_stories())
+    before = store.path.read_bytes()
+    held = store.lock()
+    held.acquire()
+    try:
+        result = save_settings(config, settings_form_values(poll_seconds="60"))
+        assert result.ok is True
+        assert json.loads(config.read_text(encoding="utf-8"))["poll_seconds"] == 60
+        assert store.path.read_bytes() == before
+    finally:
+        held.release()
+
+
+def test_collect_stories_lists_drive_folders_by_name(tmp_path, monkeypatch):
+    use_local_offset(monkeypatch)
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", "secrets/token.json")
+    monkeypatch.delenv("GOOGLE_YOUTUBE_TOKEN_PATH", raising=False)
+    write_tokens(tmp_path, DRIVE_SCOPES)
+    config = write_config(tmp_path / "config.json", drive_folder_id="root")
+    make_store(tmp_path, alpha_stories())
+    raw = story_config()
+    raw["videos"]["long"]["title"] = "Named story"
+
+    class FakeDrive:
+        def __init__(self, _http):
+            pass
+
+        def children(self, folder):
+            if folder == "root":
+                return [
+                    {
+                        "id": "alpha",
+                        "name": "Midnight Tale",
+                        "mimeType": FOLDER_MIME,
+                    }
+                ]
+            return [
+                {"id": "cfg", "name": "config.json", "mimeType": "application/json"},
+                {"id": "v1", "name": "long.mp4", "mimeType": "video/mp4"},
+                {"id": "v2", "name": "short.mp4", "mimeType": "video/mp4"},
+            ]
+
+        def read_text(self, file_id, limit):
+            assert file_id == "cfg"
+            return json.dumps(raw)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "youtube_auto_uploader.editor.Drive", lambda http: FakeDrive(http)
+    )
+
+    class Http:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(google_auth, "session", lambda _base: (Http(), lambda: None))
+    snapshot = collect_stories(config)
+    assert snapshot.message == ""
+    assert [story.name for story in snapshot.stories] == ["Midnight Tale"]
+    long = snapshot.stories[0].roles["long"]
+    assert long.stage == "uploaded"
+    assert long.title == "Named story"
+    assert long.publish_local == "2026-11-01 18:00 -06:00"
+    assert snapshot.stories[0].video_names == ["long.mp4", "short.mp4"]
+
+
+def _widgets(widget):
+    yield widget
+    for child in widget.winfo_children():
+        yield from _widgets(child)
+
+
+def test_window_opens_settings_and_the_story_editor(tmp_path):
+    tkinter = pytest.importorskip("tkinter")
+    try:
+        root = tkinter.Tk()
+    except tkinter.TclError:
+        pytest.skip("no display")
+    root.withdraw()
+    config = write_config(tmp_path / "config.json")
+    make_store(tmp_path, alpha_stories())
+    from youtube_auto_uploader.editor import StoryRow
+    from youtube_auto_uploader.gui import DesktopWindow
+
+    window = DesktopWindow(root, config)
+    try:
+        root.update()
+        assert [window.notebook.tab(tab, "text") for tab in window.notebook.tabs()] == [
+            "Status",
+            "Stories",
+            "Settings",
+        ]
+        window.notebook.select(2)
+        root.update()
+        assert window.settings_vars["youtube_channel_id"].get() == CHANNEL
+        window.settings_vars["youtube_channel_id"].set(
+            "REPLACE_WITH_YOUTUBE_CHANNEL_ID"
+        )
+        window._save_settings()
+        assert "youtube_channel_id" in window.settings_error_labels
+        assert window.settings_error_labels["youtube_channel_id"].cget("text")
+        assert "Not saved" not in window.settings_message.cget("text")
+        window.settings_vars["youtube_channel_id"].set(CHANNEL)
+        window.settings_vars["poll_seconds"].set("40")
+        window._save_settings()
+        assert json.loads(config.read_text(encoding="utf-8"))["poll_seconds"] == 40
+
+        raw = story_config()
+        story = StoryRow(
+            "alpha",
+            "Midnight Tale",
+            "cfg",
+            "",
+            ["long.mp4", "short.mp4"],
+            raw,
+            {},
+        )
+        window._open_story_editor(story)
+        root.update()
+        tops = [
+            widget
+            for widget in root.winfo_children()
+            if isinstance(widget, tkinter.Toplevel)
+        ]
+        assert len(tops) == 1
+        texts = []
+        for widget in _widgets(tops[0]):
+            try:
+                text = widget.cget("text")
+            except tkinter.TclError:
+                continue
+            if isinstance(text, str) and text:
+                texts.append(text)
+        assert any(text.startswith("Saves as ") and "T" in text for text in texts)
+        assert "Save" in texts
+        assert "Made for kids" in texts
+        tops[0].destroy()
+        root.update()
+    finally:
+        window.close()

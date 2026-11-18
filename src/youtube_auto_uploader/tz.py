@@ -128,3 +128,16 @@ def pacific_zone():
         return ZoneInfo("America/Los_Angeles")
     except ZoneInfoNotFoundError:
         return _PACIFIC_FALLBACK
+
+
+def local_zone():
+    """The machine's local zone, looked up on each call.
+
+    Import does not construct a zone. When the platform only exposes a fixed
+    offset, that offset is still explicit on a saved publish_at.
+    """
+    current = datetime.now().astimezone()
+    info = current.tzinfo
+    if info is not None and info.utcoffset(current) is not None:
+        return info
+    return timezone.utc
