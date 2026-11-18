@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from .drive import ApiError, fingerprint
 from .models import Story
-from .status import ConfigError
+from .status import ConfigError, story_reason
 from .storage import upload_log_job_id, upload_log_outcome
 from .tz import pacific_zone
 from .youtube import NeedsReview
@@ -122,19 +122,24 @@ class Runner:
             - self.clock()
         ).total_seconds()
 
-    def _source_taken(self, file_id, sid):
+    def _source_block(self, file_id, sid):
+        # Another story always blocks. This story blocks only a role that
+        # has already started, so the other role cannot upload that file too.
         for other_id, record in self.state["stories"].items():
-            if other_id == sid:
-                continue
             for job in record["jobs"].values():
-                if job["source"]["id"] == file_id:
-                    return True
-        return False
+                if job["source"]["id"] != file_id:
+                    continue
+                if other_id == sid:
+                    if upload_started(job):
+                        return "Source already belongs to a video that has started"
+                    continue
+                return "Source already belongs to another story"
+        return None
 
     def _apply_live_config(self, sid, record, story, sources):
         # publish_at and metadata follow config.json until an upload starts.
-        # Build the merged snapshot first. A started role keeps its filename,
-        # so the other role must not adopt that same name.
+        # Nothing is written until the merged snapshot is still a valid story
+        # and the new file is not one this story has already started.
         fresh = story.model_dump(mode="json")
         snapshot = record["snapshot"]
         videos = dict(snapshot["videos"])
@@ -143,13 +148,16 @@ class Runner:
             if upload_started(job):
                 continue
             new_source = sources[role]
-            if new_source["id"] != job["source"]["id"] and self._source_taken(
-                new_source["id"], sid
-            ):
-                raise ConfigError("Source already belongs to another story")
+            if new_source["id"] != job["source"]["id"]:
+                block = self._source_block(new_source["id"], sid)
+                if block:
+                    raise ConfigError(block)
             videos[role] = fresh["videos"][role]
             replacements.append((role, job, new_source))
-        Story.model_validate({**snapshot, "enabled": True, "videos": videos})
+        try:
+            Story.model_validate({**snapshot, "enabled": True, "videos": videos})
+        except ValidationError as error:
+            raise ConfigError(story_reason(error)) from error
         changed = False
         if record.get("enabled") is not True:
             record["enabled"] = True
@@ -204,6 +212,10 @@ class Runner:
             existing = self.state["stories"].get(sid)
             if existing:
                 existing["name"] = folder["name"]
+                # Finished stories keep their snapshot. Rereading them only
+                # spams errors after the Drive files are gone.
+                if all(upload_started(job) for job in existing["jobs"].values()):
+                    continue
             try:
                 story, sources = self.drive.story(sid)
                 if not story.enabled:
@@ -221,10 +233,10 @@ class Runner:
                     for v in story.videos.values()
                 ):
                     continue
-                if any(
-                    self._source_taken(source["id"], sid) for source in sources.values()
-                ):
-                    raise ConfigError("Source already belongs to another story")
+                for source in sources.values():
+                    block = self._source_block(source["id"], sid)
+                    if block:
+                        raise ConfigError(block)
                 self.state["stories"][sid] = {
                     "name": folder["name"],
                     "enabled": True,

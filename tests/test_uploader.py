@@ -423,7 +423,15 @@ def test_missed_with_video_id_is_not_reuploaded(setup):
     assert "long" not in {call.args[1]["id"] for call in youtube.start.call_args_list}
 
 
-def test_started_role_filename_is_not_reused_by_the_other_role(setup):
+def _point_story_at(drive, filenames, sources):
+    story, _old = drive.story.return_value
+    data = story.model_dump(mode="json")
+    for role, filename in filenames.items():
+        data["videos"][role]["filename"] = filename
+    drive.story.return_value = (Story.model_validate(data), sources)
+
+
+def test_started_file_rename_does_not_wedge_state(setup):
     runner, store, drive, youtube = setup
     reports = []
     runner.report = reports.append
@@ -431,20 +439,87 @@ def test_started_role_filename_is_not_reused_by_the_other_role(setup):
     record = runner.state["stories"]["story"]
     record["jobs"]["long"].update(stage="uploading", session=SESSION)
     before = copy.deepcopy(record["snapshot"])
-
-    def mutate(data):
-        data["videos"]["long"]["filename"] = "renamed-long.mp4"
-        data["videos"]["short"]["filename"] = "long.mp4"
-
-    _replace_story_config(drive, mutate)
+    short_source = copy.deepcopy(record["jobs"]["short"]["source"])
+    other = source("other")
+    other["name"] = "other.mp4"
+    reused = source("fresh-long")
+    reused["name"] = "long.mp4"
+    _point_story_at(
+        drive,
+        {"long": "other.mp4", "short": "long.mp4"},
+        {"long": other, "short": reused},
+    )
     runner.cycle()
     assert record["snapshot"] == before
     assert record["jobs"]["long"]["session"] == SESSION
+    assert record["jobs"]["long"]["source"]["id"] == "long"
+    assert record["jobs"]["short"]["source"] == short_source
     assert record["jobs"]["short"]["stage"] == "pending"
     youtube.start.assert_not_called()
-    youtube.transfer.assert_called()
+    text = "\n".join(reports)
+    assert "ConfigError" in text
+    assert "different files" in text
+    loaded = store.load()
+    Story.model_validate(loaded["stories"]["story"]["snapshot"])
+    restarted = Runner(
+        runner.settings,
+        runner.base,
+        store,
+        drive,
+        youtube,
+        report=lambda text: None,
+        clock=lambda: NOW,
+    )
+    assert restarted.state["stories"]["story"]["snapshot"] == before
+    assert restarted.state["stories"]["story"]["jobs"]["short"]["source"]["id"] == (
+        "short"
+    )
+
+
+def test_unstarted_role_cannot_take_a_started_source(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploading", session=SESSION)
+    other = source("other")
+    other["name"] = "other.mp4"
+    reused = source("long")
+    reused["name"] = "clip.mp4"
+    _point_story_at(
+        drive,
+        {"long": "other.mp4", "short": "clip.mp4"},
+        {"long": other, "short": reused},
+    )
+    runner.cycle()
+    assert record["jobs"]["short"]["source"]["id"] == "short"
+    assert record["snapshot"]["videos"]["short"]["filename"] == "short.mp4"
+    assert record["jobs"]["short"]["stage"] == "pending"
+    youtube.start.assert_not_called()
+    assert "Source already belongs to a video that has started" in "\n".join(reports)
     Story.model_validate(store.load()["stories"]["story"]["snapshot"])
-    assert any("different files" in line for line in reports)
+
+
+def test_finished_story_is_not_reread(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
+    assert drive.story.call_count == 1
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="published", video_id="known-long")
+    record["jobs"]["short"].update(stage="published", video_id="known-short")
+    drive.story.side_effect = ValueError("files deleted")
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "public", "uploadStatus": "processed"},
+    }
+    runner.cycle()
+    runner.cycle()
+    assert drive.story.call_count == 1
+    assert not any("waiting for valid config" in line for line in reports)
+    assert record["jobs"]["long"]["video_id"] == "known-long"
+    assert record["jobs"]["short"]["video_id"] == "known-short"
 
 
 def test_config_fetch_failure_does_not_upload_stale_metadata(setup):
