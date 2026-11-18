@@ -48,10 +48,9 @@ def replace_file(source, destination):
             if pause is None:
                 break
             time.sleep(pause)
-    raise ConfigError(
-        "Could not replace the file because it is still open. "
-        "Nothing was left half-written. Close the other program and try again."
-    ) from last
+    # PermissionError is an OSError, not a ValueError. The runner must not
+    # treat a busy state file as a bad story config.
+    raise last
 
 
 def atomic_json(path, data):

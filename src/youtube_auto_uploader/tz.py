@@ -158,6 +158,31 @@ def _sync_libc_zone():
         time.tzset()
 
 
+def _second_occurrence(local, stamp):
+    """1 when this instant is the later of two times with the same wall clock."""
+    if getattr(local, "tm_isdst", -1) != 0:
+        return 0
+    try:
+        earlier = time.mktime(
+            (
+                local.tm_year,
+                local.tm_mon,
+                local.tm_mday,
+                local.tm_hour,
+                local.tm_min,
+                local.tm_sec,
+                -1,
+                -1,
+                1,
+            )
+        )
+    except (OverflowError, OSError, ValueError):
+        return 0
+    if abs(earlier - stamp) > 1:
+        return 1
+    return 0
+
+
 def _struct_offset(local, stamp):
     gmtoff = getattr(local, "tm_gmtoff", None)
     if gmtoff is not None:
@@ -232,6 +257,7 @@ class _LibcLocal(tzinfo):
             local.tm_sec,
             dt.microsecond,
             tzinfo=self,
+            fold=_second_occurrence(local, stamp),
         )
 
 

@@ -8,10 +8,15 @@ from youtube_auto_uploader import google_auth
 from youtube_auto_uploader.editor import (
     FOLDER_MIME,
     RUNNER_BUSY,
+    apply_retry,
+    assemble_story_views,
     collect_stories,
     confirmation_for,
+    format_publish_at,
     reload_from_drive,
     reload_stories,
+    retry_decision,
+    retry_saved,
     save_settings,
     settings_form,
 )
@@ -137,6 +142,155 @@ def write_tokens(base, drive_scopes):
 
 def use_local_offset(monkeypatch):
     monkeypatch.setattr("youtube_auto_uploader.editor.local_zone", lambda: OFFSET)
+
+
+def test_libc_display_uses_the_later_fall_back_offset(monkeypatch):
+    import os
+    import time
+    from zoneinfo import ZoneInfoNotFoundError
+
+    import youtube_auto_uploader.tz as tz
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("tzset is Unix-only")
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+
+    def missing(key):
+        raise ZoneInfoNotFoundError(key)
+
+    monkeypatch.setattr(tz, "ZoneInfo", missing)
+    try:
+        assert (
+            format_publish_at("2026-11-01T08:30:00+00:00") == "2026-11-01 01:30 -07:00"
+        )
+        assert (
+            format_publish_at("2026-11-01T09:30:00+00:00") == "2026-11-01 01:30 -08:00"
+        )
+    finally:
+        os.environ.pop("TZ", None)
+        time.tzset()
+
+
+def test_story_list_shows_names_stage_local_time_title_and_error(monkeypatch):
+    use_local_offset(monkeypatch)
+    raw = story_config()
+    raw["videos"]["long"]["title"] = "Full tale"
+    raw["videos"]["short"]["title"] = "Quick tale"
+    from youtube_auto_uploader.editor import FolderFiles
+
+    folders = [
+        {"id": "beta", "name": "Zebra", "mimeType": FOLDER_MIME},
+        {"id": "alpha", "name": "Midnight Tale", "mimeType": FOLDER_MIME},
+        {"id": "note", "name": "notes.txt", "mimeType": "text/plain"},
+    ]
+    details = {
+        "alpha": FolderFiles("cfg-alpha", raw, "", ["long.mp4", "short.mp4"]),
+        "beta": FolderFiles(None, None, "Expected one config.json; found 0", []),
+    }
+    state = {"stories": alpha_stories()}
+    rows = assemble_story_views(folders, details, state)
+    assert [row.name for row in rows] == ["Midnight Tale", "Zebra"]
+    alpha = rows[0]
+    assert alpha.folder_id == "alpha"
+    assert alpha.roles["long"].stage == "uploaded"
+    assert alpha.roles["long"].title == "Full tale"
+    assert alpha.roles["long"].publish_local == "2026-11-01 18:00 -06:00"
+    assert alpha.roles["long"].error == ""
+    assert alpha.roles["long"].retry_allowed is False
+    assert "duplicate upload" in alpha.roles["long"].retry_reason
+    short = alpha.roles["short"]
+    assert short.stage == "needs_review"
+    assert short.title == "Quick tale"
+    assert short.error == "quota exceeded"
+    assert short.retry_allowed is True
+    assert rows[1].config_error == "Expected one config.json; found 0"
+    assert rows[1].roles["long"].stage == "not started"
+    assert rows[1].roles["long"].retry_allowed is False
+
+
+@pytest.mark.parametrize("stage", ["needs_review", "failed", "missed"])
+def test_retry_resets_an_unstarted_job_and_keeps_the_story(tmp_path, stage):
+    stories = alpha_stories()
+    stories["alpha"]["jobs"]["short"]["stage"] = stage
+    stories["alpha"]["jobs"]["short"]["consecutive_failures"] = 10
+    stories["alpha"]["jobs"]["short"]["noticed_publish_at"] = (
+        "2026-01-01T00:00:00+00:00"
+    )
+    store = make_store(tmp_path, stories)
+    config = write_config(tmp_path / "config.json")
+    before_long = json.loads(json.dumps(stories["alpha"]["jobs"]["long"]))
+    result = retry_saved(config, "alpha", "short")
+    assert result.ok is True
+    assert "waiting" in result.message
+    saved = store.load()
+    assert list(saved["stories"]) == ["alpha"]
+    short = saved["stories"]["alpha"]["jobs"]["short"]
+    assert short["stage"] == "waiting"
+    assert "error" not in short
+    assert "next_retry" not in short
+    assert "cache_md5" not in short
+    assert short["source"]["id"] == "alpha-short"
+    assert short["attempts"] == 0
+    assert short["consecutive_failures"] == 0
+    assert "noticed_publish_at" not in short
+    assert saved["stories"]["alpha"]["jobs"]["long"] == before_long
+    assert saved["binding"]["drive_folder_id"] == ROOT
+
+
+def test_retry_is_off_when_a_video_id_or_session_could_duplicate(tmp_path):
+    stories = alpha_stories()
+    stories["alpha"]["jobs"]["short"]["session"] = "https://upload.example/session"
+    stories["alpha"]["jobs"]["short"].pop("video_id", None)
+    store = make_store(tmp_path, stories)
+    config = write_config(tmp_path / "config.json")
+    allowed, reason = retry_decision(stories["alpha"]["jobs"]["long"])
+    assert allowed is False
+    assert "duplicate upload" in reason
+    allowed, reason = retry_decision(stories["alpha"]["jobs"]["short"])
+    assert allowed is False
+    assert "duplicate upload" in reason
+    before = store.path.read_bytes()
+    result = retry_saved(config, "alpha", "short")
+    assert result.ok is False
+    assert "duplicate upload" in result.message
+    assert store.path.read_bytes() == before
+    pending = job("pending", "alpha-short")
+    allowed, reason = retry_decision(pending)
+    assert allowed is False
+    assert "pending" in reason
+
+
+def test_retry_is_refused_while_the_runner_holds_the_lock(tmp_path):
+    store = make_store(tmp_path, alpha_stories())
+    config = write_config(tmp_path / "config.json")
+    before = store.path.read_bytes()
+    held = store.lock()
+    held.acquire()
+    try:
+        result = retry_saved(config, "alpha", "short")
+        assert result.ok is False
+        assert result.message == RUNNER_BUSY
+        assert "uploading" in result.message
+        assert store.path.read_bytes() == before
+    finally:
+        held.release()
+    with store.lock():
+        saved = store.load()
+    assert saved["stories"]["alpha"]["jobs"]["short"]["stage"] == "needs_review"
+    assert saved["stories"]["alpha"]["jobs"]["short"]["error"] == "quota exceeded"
+
+
+def test_retry_failure_does_not_write_a_partial_story(tmp_path):
+    store = make_store(tmp_path, alpha_stories())
+    config = write_config(tmp_path / "config.json")
+    before = store.path.read_bytes()
+    result = retry_saved(config, "missing", "long")
+    assert result.ok is False
+    assert "not in saved history" in result.message
+    assert store.path.read_bytes() == before
+    apply_retry(store.load()["stories"]["alpha"]["jobs"]["short"])
+    # The in-memory reset above is not a save. The file still has the error.
+    assert b"quota exceeded" in store.path.read_bytes()
 
 
 def test_settings_validation_is_inline_and_keeps_unedited_fields(tmp_path):

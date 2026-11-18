@@ -82,6 +82,11 @@ def public_error(error):
         return story_reason(error)
     if isinstance(error, (ConfigError, ApiError)):
         return str(error)
+    if isinstance(error, PermissionError):
+        return (
+            "Could not replace the file because it is still open. "
+            "Nothing was left half-written. Close the other program and try again."
+        )
     message = (
         f"Error ({type(error).__name__}). "
         "Check configuration, credentials, and saved status; no history was reset."
