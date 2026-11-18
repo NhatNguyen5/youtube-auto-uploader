@@ -94,6 +94,7 @@ def validate_story_state(story):
             "scheduling",
             "scheduled",
             "published",
+            "waiting",
             "missed",
             "failed",
             "needs_review",
@@ -127,8 +128,8 @@ def upload_log_outcome(job):
     """Return (status, error) for one finished upload attempt, or None.
 
     Local state decides whether YouTube already has the video. A saved
-    video_id must not be uploaded again. Missed deadlines and transfers
-    still in progress are not log lines.
+    video_id must not be uploaded again. Unstarted jobs left waiting after
+    the publish time, and transfers still in progress, are not log lines.
     """
     stage = job.get("stage")
     video_id = job.get("video_id") or ""

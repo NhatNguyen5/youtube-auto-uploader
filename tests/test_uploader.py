@@ -251,16 +251,326 @@ def test_atomic_failure_preserves_previous_state(tmp_path, monkeypatch):
     assert parse_json(path.read_text()) == {"old": True}
 
 
-def test_discovery_freezes_both_variants_and_renames_without_duplicates(setup):
+def _set_story_publish_at(drive, moment):
+    story, sources = drive.story.return_value
+    data = story.model_dump(mode="json")
+    stamp = moment.isoformat()
+    for video in data["videos"].values():
+        video["publish_at"] = stamp
+    drive.story.return_value = (Story.model_validate(data), sources)
+
+
+def _replace_story_config(drive, mutate):
+    story, sources = drive.story.return_value
+    data = story.model_dump(mode="json")
+    mutate(data)
+    drive.story.return_value = (Story.model_validate(data), sources)
+    return data
+
+
+def test_rename_keeps_one_story_and_rereads_config(setup):
     runner, store, drive, youtube = setup
     runner.discover()
-    old = copy.deepcopy(runner.state["stories"]["story"]["snapshot"])
+
+    def mutate(data):
+        data["videos"]["short"]["title"] = "Changed"
+
+    _replace_story_config(drive, mutate)
     drive.children.return_value[0]["name"] = "Renamed"
-    drive.story.return_value[0].videos["short"].title = "Changed"
     runner.discover()
-    assert len(runner.state["stories"]) == 1
-    assert runner.state["stories"]["story"]["snapshot"] == old
+    record = runner.state["stories"]["story"]
+    assert list(runner.state["stories"]) == ["story"]
+    assert record["name"] == "Renamed"
+    assert record["snapshot"]["videos"]["short"]["title"] == "Changed"
+    assert drive.story.call_count == 2
+
+
+def test_config_edit_before_upload_is_honored(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    later = (NOW + timedelta(hours=2)).isoformat()
+
+    def mutate(data):
+        data["videos"]["long"]["title"] = "Updated title"
+        data["videos"]["long"]["publish_at"] = later
+        data["videos"]["short"]["description"] = "Updated description"
+        data["videos"]["short"]["publish_at"] = later
+
+    _replace_story_config(drive, mutate)
+    runner.cycle()
+    by_role = {
+        call.args[1]["id"]: call.args[0] for call in youtube.start.call_args_list
+    }
+    assert set(by_role) == {"long", "short"}
+    assert by_role["long"].title == "Updated title"
+    assert by_role["long"].publish_at.isoformat() == later
+    assert by_role["short"].description == "Updated description"
+    assert (
+        runner.state["stories"]["story"]["snapshot"]["videos"]["long"]["title"]
+        == "Updated title"
+    )
+
+
+def test_past_publish_at_waits_and_uploads_after_a_future_edit(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    passed = "Story story long: publish time passed, waiting for a new publish_at"
+    _set_story_publish_at(drive, NOW - timedelta(minutes=5))
+    runner.cycle()
+    youtube.start.assert_not_called()
+    youtube.transfer.assert_not_called()
+    jobs = runner.state["stories"]["story"]["jobs"]
+    assert jobs["long"]["stage"] == "waiting"
+    assert jobs["short"]["stage"] == "waiting"
+    assert reports.count(passed) == 1
+    runner.cycle()
+    assert reports.count(passed) == 1
+    youtube.start.assert_not_called()
+    _set_story_publish_at(drive, NOW - timedelta(minutes=1))
+    runner.cycle()
+    assert reports.count(passed) == 2
+    youtube.start.assert_not_called()
+    _set_story_publish_at(drive, NOW + timedelta(hours=1))
+    runner.cycle()
+    assert {call.args[1]["id"] for call in youtube.start.call_args_list} == {
+        "long",
+        "short",
+    }
+    assert jobs["long"]["stage"] != "waiting"
+
+
+def test_legacy_missed_without_upload_becomes_eligible(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    for job in record["jobs"].values():
+        job["stage"] = "missed"
+    store.save(runner.state)
+    restarted = Runner(
+        runner.settings,
+        runner.base,
+        store,
+        drive,
+        youtube,
+        report=lambda text: None,
+        clock=lambda: NOW,
+    )
+    restarted.cycle()
+    assert {call.args[1]["id"] for call in youtube.start.call_args_list} == {
+        "long",
+        "short",
+    }
+    saved = store.load()["stories"]["story"]["jobs"]
+    assert saved["long"]["stage"] != "missed"
+    assert saved["short"]["stage"] != "missed"
+
+
+def test_video_id_is_never_reuploaded_when_config_changes(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploaded", video_id="known")
+    old_long = copy.deepcopy(record["snapshot"]["videos"]["long"])
+
+    def mutate(data):
+        data["videos"]["long"]["title"] = "Should not apply"
+        data["videos"]["long"]["publish_at"] = (NOW + timedelta(hours=5)).isoformat()
+        data["videos"]["short"]["title"] = "Short updated"
+
+    _replace_story_config(drive, mutate)
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "private", "uploadStatus": "uploaded"},
+        "processingDetails": {"processingStatus": "processing"},
+    }
+    runner.cycle()
+    assert record["jobs"]["long"]["video_id"] == "known"
+    assert record["snapshot"]["videos"]["long"] == old_long
+    assert record["snapshot"]["videos"]["short"]["title"] == "Short updated"
+    assert [call.args[1]["id"] for call in youtube.start.call_args_list] == ["short"]
+    assert youtube.start.call_args.args[0].title == "Short updated"
+
+
+def test_session_keeps_its_snapshot_when_config_publish_at_passes(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploading", session=SESSION)
+    old_long = copy.deepcopy(record["snapshot"]["videos"]["long"])
+    _set_story_publish_at(drive, NOW - timedelta(hours=1))
+    runner.cycle()
+    youtube.transfer.assert_called()
+    assert record["jobs"]["long"]["session"] == SESSION
+    assert record["snapshot"]["videos"]["long"] == old_long
+    assert record["jobs"]["short"]["stage"] == "waiting"
+    youtube.start.assert_not_called()
+
+
+def test_missed_with_video_id_is_not_reuploaded(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="missed", video_id="known")
+
+    def mutate(data):
+        data["videos"]["long"]["title"] = "Should not apply"
+        data["videos"]["long"]["publish_at"] = (NOW + timedelta(hours=2)).isoformat()
+
+    _replace_story_config(drive, mutate)
+    runner.cycle()
+    assert record["jobs"]["long"]["video_id"] == "known"
+    assert record["jobs"]["long"]["stage"] == "missed"
+    assert "long" not in {call.args[1]["id"] for call in youtube.start.call_args_list}
+
+
+def _point_story_at(drive, filenames, sources):
+    story, _old = drive.story.return_value
+    data = story.model_dump(mode="json")
+    for role, filename in filenames.items():
+        data["videos"][role]["filename"] = filename
+    drive.story.return_value = (Story.model_validate(data), sources)
+
+
+def test_started_file_rename_does_not_wedge_state(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploading", session=SESSION)
+    before = copy.deepcopy(record["snapshot"])
+    short_source = copy.deepcopy(record["jobs"]["short"]["source"])
+    other = source("other")
+    other["name"] = "other.mp4"
+    reused = source("fresh-long")
+    reused["name"] = "long.mp4"
+    _point_story_at(
+        drive,
+        {"long": "other.mp4", "short": "long.mp4"},
+        {"long": other, "short": reused},
+    )
+    runner.cycle()
+    assert record["snapshot"] == before
+    assert record["jobs"]["long"]["session"] == SESSION
+    assert record["jobs"]["long"]["source"]["id"] == "long"
+    assert record["jobs"]["short"]["source"] == short_source
+    assert record["jobs"]["short"]["stage"] == "pending"
+    youtube.start.assert_not_called()
+    text = "\n".join(reports)
+    assert "ConfigError" in text
+    assert "different files" in text
+    loaded = store.load()
+    Story.model_validate(loaded["stories"]["story"]["snapshot"])
+    restarted = Runner(
+        runner.settings,
+        runner.base,
+        store,
+        drive,
+        youtube,
+        report=lambda text: None,
+        clock=lambda: NOW,
+    )
+    assert restarted.state["stories"]["story"]["snapshot"] == before
+    assert restarted.state["stories"]["story"]["jobs"]["short"]["source"]["id"] == (
+        "short"
+    )
+
+
+def test_unstarted_role_cannot_take_a_started_source(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploading", session=SESSION)
+    other = source("other")
+    other["name"] = "other.mp4"
+    reused = source("long")
+    reused["name"] = "clip.mp4"
+    _point_story_at(
+        drive,
+        {"long": "other.mp4", "short": "clip.mp4"},
+        {"long": other, "short": reused},
+    )
+    runner.cycle()
+    assert record["jobs"]["short"]["source"]["id"] == "short"
+    assert record["snapshot"]["videos"]["short"]["filename"] == "short.mp4"
+    assert record["jobs"]["short"]["stage"] == "pending"
+    youtube.start.assert_not_called()
+    assert "Source already belongs to a video that has started" in "\n".join(reports)
+    Story.model_validate(store.load()["stories"]["story"]["snapshot"])
+
+
+def test_finished_story_is_not_reread(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
     assert drive.story.call_count == 1
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="published", video_id="known-long")
+    record["jobs"]["short"].update(stage="published", video_id="known-short")
+    drive.story.side_effect = ValueError("files deleted")
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "public", "uploadStatus": "processed"},
+    }
+    runner.cycle()
+    runner.cycle()
+    assert drive.story.call_count == 1
+    assert not any("waiting for valid config" in line for line in reports)
+    assert record["jobs"]["long"]["video_id"] == "known-long"
+    assert record["jobs"]["short"]["video_id"] == "known-short"
+
+
+def test_config_fetch_failure_does_not_upload_stale_metadata(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["jobs"]["long"].update(stage="uploaded", video_id="known")
+    youtube.inspect.return_value = {
+        "status": {"privacyStatus": "private", "uploadStatus": "uploaded"},
+        "processingDetails": {"processingStatus": "processing"},
+    }
+    drive.story.side_effect = requests.ConnectionError("secret URL must not be logged")
+    runner.cycle()
+    youtube.inspect.assert_called_with("known")
+    youtube.start.assert_not_called()
+    assert record["jobs"]["short"]["stage"] == "pending"
+    text = "\n".join(reports)
+    assert "Story story: ConnectionError" in text
+    assert "secret URL" not in text
+
+    drive.story.side_effect = ApiError(503, "backendError")
+    runner.cycle()
+    youtube.start.assert_not_called()
+    assert "Story story: HTTP 503: backendError" in "\n".join(reports)
+
+
+def test_disabled_story_is_not_uploaded(setup):
+    runner, store, drive, youtube = setup
+
+    def mutate(data):
+        data["enabled"] = False
+
+    _replace_story_config(drive, mutate)
+    runner.cycle()
+    assert runner.state["stories"] == {}
+    youtube.start.assert_not_called()
+
+
+def test_disabling_before_upload_skips_the_story(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+
+    def mutate(data):
+        data["enabled"] = False
+
+    _replace_story_config(drive, mutate)
+    runner.cycle()
+    youtube.start.assert_not_called()
+    assert runner.state["stories"]["story"]["enabled"] is False
 
 
 def test_partial_success_only_uploads_remaining_video(setup):
@@ -311,7 +621,7 @@ def test_expired_deadline_never_starts_upload(setup):
     runner.clock = lambda: NOW + timedelta(hours=2)
     runner.cycle()
     youtube.start.assert_not_called()
-    assert runner.state["stories"]["story"]["jobs"]["long"]["stage"] == "missed"
+    assert runner.state["stories"]["story"]["jobs"]["long"]["stage"] == "waiting"
 
 
 def test_lost_schedule_response_is_reconciled_after_deadline(setup):
@@ -666,6 +976,7 @@ def test_upload_log_outcome_matches_saved_upload():
         upload_log_outcome({"stage": "uploading", "session": "https://upload"}) is None
     )
     assert upload_log_outcome({"stage": "missed"}) is None
+    assert upload_log_outcome({"stage": "waiting"}) is None
     assert upload_log_outcome({"stage": "needs_review", "error": "validation"}) is None
 
 
@@ -940,12 +1251,9 @@ def test_incomplete_session_no_progress_does_not_loop(tmp_path):
 
 def _due_snapshot(runner, hours):
     runner.settings.upload_lead_minutes = 24 * 60
+    _set_story_publish_at(runner.drive, NOW + timedelta(hours=hours))
     runner.discover()
-    record = runner.state["stories"]["story"]
-    later = (NOW + timedelta(hours=hours)).isoformat()
-    for video in record["snapshot"]["videos"].values():
-        video["publish_at"] = later
-    return record
+    return runner.state["stories"]["story"]
 
 
 @pytest.mark.parametrize("reason", ["quotaExceeded", "dailyLimitExceeded"])
@@ -1015,13 +1323,15 @@ def test_quota_403_gives_up_after_publish_deadline(setup):
     assert job["next_retry"]
     assert job["attempts"] == 0
     youtube.start.reset_mock()
-    runner.clock = lambda: datetime.fromisoformat(job["next_retry"])
+    retry_at = datetime.fromisoformat(job["next_retry"])
+    runner.clock = lambda: retry_at
     runner.cycle()
-    assert job["stage"] == "missed"
+    assert job["stage"] == "waiting"
+    assert runner.state["stories"]["story"]["jobs"]["short"]["stage"] == "waiting"
     youtube.start.assert_not_called()
 
 
-def test_quota_403_misses_unstarted_job_already_past_deadline(setup, monkeypatch):
+def test_quota_403_waits_on_unstarted_job_already_past_deadline(setup, monkeypatch):
     runner, store, drive, youtube = setup
     runner.discover()
     record = runner.state["stories"]["story"]
@@ -1033,7 +1343,7 @@ def test_quota_403_misses_unstarted_job_already_past_deadline(setup, monkeypatch
     monkeypatch.setattr(runner, "step", explode)
     runner.process("story", "long", record)
     job = record["jobs"]["long"]
-    assert job["stage"] == "missed"
+    assert job["stage"] == "waiting"
     assert job["attempts"] == 0
     assert not job.get("next_retry")
 
@@ -1079,9 +1389,7 @@ def test_429_retry_after_is_a_floor_above_the_cap(setup):
     runner, store, drive, youtube = setup
     runner.discover()
     record = runner.state["stories"]["story"]
-    later = (NOW + timedelta(hours=3)).isoformat()
-    for video in record["snapshot"]["videos"].values():
-        video["publish_at"] = later
+    _set_story_publish_at(drive, NOW + timedelta(hours=3))
     original = drive.download.side_effect
 
     def download(src, path):
