@@ -48,16 +48,17 @@ class StatusSnapshot:
         self.message = message
 
 
-def status_line(story_id, role, job):
+def status_line(story_id, role, job, name=None):
     """One line, matching the `status` command."""
-    return format_status_line(story_id, role, job)
+    return format_status_line(story_id, role, job, name)
 
 
 def status_rows(state):
     rows = []
     for story_id, story in state["stories"].items():
+        name = story.get("name")
         for role, job in story["jobs"].items():
-            rows.append(status_line(story_id, role, job))
+            rows.append(status_line(story_id, role, job, name))
     return rows
 
 
