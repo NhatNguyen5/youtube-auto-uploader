@@ -13,7 +13,7 @@ from .drive import ApiError, Drive
 from .models import Settings, Story
 from .runner import Runner, poll_retry
 from .stats import export_stats, stats_targets
-from .status import ConfigError, format_status_line, public_error
+from .status import ConfigError, configure_stdio, format_status_line, public_error
 from .storage import Store, parse_json
 from .youtube import YouTube
 
@@ -113,6 +113,7 @@ def interruptible_sleep(seconds):
 
 
 def main():
+    configure_stdio()
     install_console_interrupt_handler()
     parser = argparse.ArgumentParser(
         description="Upload Drive story pairs and schedule publication"
@@ -189,7 +190,7 @@ def main():
                 state = store.load()
                 for sid, story in state["stories"].items():
                     for role, job in story["jobs"].items():
-                        print(format_status_line(sid, role, job))
+                        print(format_status_line(sid, role, job, story.get("name")))
                 if not state["stories"]:
                     print("No stories started yet.")
                 return 0

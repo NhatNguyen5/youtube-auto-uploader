@@ -30,7 +30,7 @@ from .editor import (
     settings_form,
     validate_story_form,
 )
-from .status import ConfigError, public_error
+from .status import ConfigError, configure_stdio, public_error
 
 POLL_MS = 100
 CHECKS_PLACEHOLDER = "No validate result yet."
@@ -45,6 +45,7 @@ SETTING_FIELDS = (
 
 
 def launch(config_path):
+    configure_stdio()
     try:
         import tkinter as tk
     except ImportError:

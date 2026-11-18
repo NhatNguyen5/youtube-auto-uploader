@@ -18,6 +18,7 @@ from youtube_auto_uploader.drive import (
 )
 from youtube_auto_uploader.models import Settings, Story
 from youtube_auto_uploader.runner import Runner, poll_retry, scheduled_delay
+from youtube_auto_uploader.status import ConfigError
 from youtube_auto_uploader.storage import (
     Store,
     atomic_json,
@@ -315,7 +316,9 @@ def test_past_publish_at_waits_and_uploads_after_a_future_edit(setup):
     runner, store, drive, youtube = setup
     reports = []
     runner.report = reports.append
-    passed = "Story story long: publish time passed, waiting for a new publish_at"
+    passed = (
+        "Story Story [story] long: publish time passed, waiting for a new publish_at"
+    )
     _set_story_publish_at(drive, NOW - timedelta(minutes=5))
     runner.cycle()
     youtube.start.assert_not_called()
@@ -539,13 +542,13 @@ def test_config_fetch_failure_does_not_upload_stale_metadata(setup):
     youtube.start.assert_not_called()
     assert record["jobs"]["short"]["stage"] == "pending"
     text = "\n".join(reports)
-    assert "Story story: ConnectionError" in text
+    assert "Story Story [story]: ConnectionError" in text
     assert "secret URL" not in text
 
     drive.story.side_effect = ApiError(503, "backendError")
     runner.cycle()
     youtube.start.assert_not_called()
-    assert "Story story: HTTP 503: backendError" in "\n".join(reports)
+    assert "Story Story [story]: HTTP 503: backendError" in "\n".join(reports)
 
 
 def test_disabled_story_is_not_uploaded(setup):
@@ -882,10 +885,119 @@ def test_waiting_log_includes_story_error(setup):
     runner.discover()
     assert runner.state["stories"] == {}
     assert reports == [
-        "Story story: waiting for valid config and two unique videos "
+        "Story Story [story]: waiting for valid config and two unique videos "
         "(ValueError: Source must be a nonempty video file)"
     ]
     youtube.start.assert_not_called()
+
+
+def test_runner_reports_use_the_folder_name_and_fall_back_to_the_id(setup):
+    runner, store, drive, youtube = setup
+    reports = []
+    runner.report = reports.append
+    folder_id = "1fdyS-2RBEBEd7swBLXKYsaZlHwjw2ttG"
+    drive.children.return_value = [
+        {
+            "id": folder_id,
+            "name": "The Gray Hall",
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+    ]
+    drive.story.side_effect = ValueError("Source must be a nonempty video file")
+    runner.discover()
+    assert reports == [
+        "Story The Gray Hall "
+        f"[{folder_id}]: waiting for valid config and two unique videos "
+        "(ValueError: Source must be a nonempty video file)"
+    ]
+    assert runner.state["stories"] == {}
+
+    reports.clear()
+    drive.children.return_value = [
+        {
+            "id": "unnamed-folder",
+            "name": "   ",
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+    ]
+    runner.discover()
+    assert reports == [
+        "Story unnamed-folder: waiting for valid config and two unique videos "
+        "(ValueError: Source must be a nonempty video file)"
+    ]
+
+    reports.clear()
+    drive.story.side_effect = None
+    drive.story.return_value = (
+        Story.model_validate(story_data()),
+        {role: source(role) for role in ("long", "short")},
+    )
+    drive.children.return_value = [
+        {
+            "id": folder_id,
+            "name": "The Gray Hall",
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+    ]
+    runner.discover()
+    record = runner.state["stories"][folder_id]
+    assert record["name"] == "The Gray Hall"
+    drive.download.side_effect = ConfigError("Category is not assignable")
+    runner.process(folder_id, "short", record)
+    assert reports[-1] == f"The Gray Hall [{folder_id}] / short: needs_review"
+    assert record["jobs"]["short"]["error"] == "Category is not assignable"
+
+    record["name"] = "  "
+    reports.clear()
+    drive.download.side_effect = ConfigError("Insufficient cache disk space")
+    runner.process(folder_id, "long", record)
+    assert reports[-1] == f"{folder_id} / long: needs_review"
+    assert record["jobs"]["long"]["error"] == "Insufficient cache disk space"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Drive source changed since snapshot",
+        "Category is not assignable",
+        "Insufficient cache disk space",
+    ],
+)
+def test_config_error_review_reason_is_preserved(setup, message):
+    runner, store, drive, youtube = setup
+    assert issubclass(ConfigError, ValueError)
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    drive.download.side_effect = ConfigError(message)
+    runner.process("story", "long", record)
+    job = store.load()["stories"]["story"]["jobs"]["long"]
+    assert job["stage"] == "needs_review"
+    assert job["error"] == message
+    assert job["error"] != "Source or metadata validation failed"
+
+
+def test_other_value_error_stays_generic(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    drive.download.side_effect = ValueError("secret-token https://upload.example/token")
+    runner.process("story", "long", record)
+    job = store.load()["stories"]["story"]["jobs"]["long"]
+    assert job["stage"] == "needs_review"
+    assert job["error"] == "Source or metadata validation failed"
+    assert "secret-token" not in job["error"]
+
+
+def test_pydantic_validation_error_stays_generic(setup):
+    runner, store, drive, youtube = setup
+    runner.discover()
+    record = runner.state["stories"]["story"]
+    record["snapshot"]["videos"]["long"]["title"] = "secret-token " + ("x" * 120)
+    runner.process("story", "long", record)
+    job = record["jobs"]["long"]
+    assert job["stage"] == "needs_review"
+    assert job["error"] == "Source or metadata validation failed"
+    assert "secret-token" not in job["error"]
 
 
 def test_corrupt_uploaded_state_cannot_become_new_job(setup):
@@ -1223,7 +1335,7 @@ def test_story_discovery_error_does_not_block_other_stories(setup, failure, repo
         "short",
     }
     text = "\n".join(reports)
-    assert f"Story folder-a: {reported}" in text
+    assert f"Story Broken [folder-a]: {reported}" in text
     assert "secret URL" not in text
 
 

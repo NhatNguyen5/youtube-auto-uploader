@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from .drive import ApiError, fingerprint
 from .models import Story
-from .status import ConfigError, story_reason
+from .status import ConfigError, story_label, story_reason
 from .storage import upload_log_job_id, upload_log_outcome
 from .tz import pacific_zone
 from .youtube import NeedsReview
@@ -191,7 +191,7 @@ class Runner:
     def _apply_live_config(self, sid, record, story, sources):
         return apply_live_config(self.state, sid, record, story, sources)
 
-    def _mark_waiting(self, sid, role, job, video):
+    def _mark_waiting(self, sid, role, job, video, record):
         stamp = video.publish_at.isoformat()
         announce = job.get("noticed_publish_at") != stamp
         changed = job.get("stage") != "waiting" or "next_retry" in job or announce
@@ -199,8 +199,10 @@ class Runner:
         job.pop("next_retry", None)
         if announce:
             job["noticed_publish_at"] = stamp
+            label = story_label(record.get("name"), sid)
             self.report(
-                f"Story {sid} {role}: publish time passed, waiting for a new publish_at"
+                f"Story {label} {role}: publish time passed, "
+                "waiting for a new publish_at"
             )
         if changed:
             self.save()
@@ -223,6 +225,7 @@ class Runner:
             if folder["mimeType"] != "application/vnd.google-apps.folder":
                 continue
             sid = folder["id"]
+            label = story_label(folder.get("name"), sid)
             existing = self.state["stories"].get(sid)
             if existing:
                 existing["name"] = folder["name"]
@@ -271,13 +274,13 @@ class Runner:
                     self._skip_unstarted.add(sid)
                 self.report(
                     "Story "
-                    f"{sid}: waiting for valid config and two unique videos "
+                    f"{label}: waiting for valid config and two unique videos "
                     f"({type(error).__name__}: {error})"
                 )
             except ApiError as error:
                 if existing is not None:
                     self._skip_unstarted.add(sid)
-                self.report(f"Story {sid}: HTTP {error.status}: {error.reason}")
+                self.report(f"Story {label}: HTTP {error.status}: {error.reason}")
             except requests.RequestException as error:
                 if existing is not None:
                     self._skip_unstarted.add(sid)
@@ -286,9 +289,9 @@ class Runner:
                 status = getattr(response, "status_code", None)
                 reason = getattr(response, "reason", None) or type(error).__name__
                 if status is None:
-                    self.report(f"Story {sid}: {reason}")
+                    self.report(f"Story {label}: {reason}")
                 else:
-                    self.report(f"Story {sid}: HTTP {status}: {reason}")
+                    self.report(f"Story {label}: HTTP {status}: {reason}")
 
     def step(self, sid, role, record):
         video = Story.model_validate(record["snapshot"]).videos[role]
@@ -364,7 +367,7 @@ class Runner:
         # Recover an existing session even after deadline to resolve upload identity.
         if not job.get("session"):
             if self.clock() >= video.publish_at:
-                self._mark_waiting(sid, role, job, video)
+                self._mark_waiting(sid, role, job, video, record)
                 return
             self._release_wait(job)
             if self.clock() < video.publish_at - timedelta(
@@ -391,7 +394,7 @@ class Runner:
             self.save()
         if not job.get("session"):
             if self.clock() >= video.publish_at:
-                self._mark_waiting(sid, role, job, video)
+                self._mark_waiting(sid, role, job, video, record)
                 return
             self.youtube.validate_category(video.category_id)
             job["session"] = self.youtube.start(video, source)
@@ -422,7 +425,7 @@ class Runner:
             if kind == "quota":
                 video = Story.model_validate(record["snapshot"]).videos[role]
                 if self.clock() >= video.publish_at and not upload_started(job):
-                    self._mark_waiting(sid, role, job, video)
+                    self._mark_waiting(sid, role, job, video, record)
                 else:
                     moment = self.clock()
                     until_reset = (next_quota_reset(moment) - moment).total_seconds()
@@ -445,6 +448,11 @@ class Runner:
             else:
                 job["stage"] = "needs_review"
             self.save()
+        except ConfigError as error:
+            # ConfigError is a ValueError. Its text is written for operators.
+            # Other ValueErrors (including pydantic) can contain input values.
+            job.update(stage="needs_review", error=str(error))
+            self.save()
         except ValueError:
             job.update(
                 stage="needs_review", error="Source or metadata validation failed"
@@ -453,7 +461,8 @@ class Runner:
         # Storage/OAuth errors deliberately propagate: do not continue remote work.
         # A publish time that is still in the past was already announced once.
         if not (before == "waiting" and job["stage"] == "waiting"):
-            self.report(f"{sid}/{role}: {job['stage']}")
+            label = story_label(record.get("name"), sid)
+            self.report(f"{label} / {role}: {job['stage']}")
         self.record_upload_log(sid, role, record)
 
     def record_upload_log(self, sid, role, record):
@@ -487,19 +496,20 @@ class Runner:
         try:
             self.drive.append_upload_log(folder, payload)
         except requests.RequestException:
-            self._report_log_failure(sid, role, job, "Network failure")
+            self._report_log_failure(sid, role, job, "Network failure", record)
             return
         except (ApiError, ValueError) as exc:
-            self._report_log_failure(sid, role, job, str(exc))
+            self._report_log_failure(sid, role, job, str(exc), record)
             return
         job["log_recorded"] = True
         job.pop("log_error", None)
         self.save()
 
-    def _report_log_failure(self, sid, role, job, detail):
+    def _report_log_failure(self, sid, role, job, detail, record):
         job["log_error"] = detail
         self.save()
-        self.report(f"{sid}/{role}: upload log failed ({detail})")
+        label = story_label(record.get("name"), sid)
+        self.report(f"{label} / {role}: upload log failed ({detail})")
 
     def reconcile_uploaded(self):
         for sid, record in list(self.state["stories"].items()):
